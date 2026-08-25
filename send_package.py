@@ -21,12 +21,18 @@
 require_confirmation` — она одна на обоих клиентов.
 
 ПРИМЕНЕНИЕ И ПУБЛИКАЦИЯ ИДУТ ОДНИМ ВЫЗОВОМ. Ручка сервера применяет пакет,
-рассылает уведомления и публикует итог в чате отдела; отдельного «применить, не
-публикуя» у неё нет. Флаг `--publish` поэтому нужен только локальному режиму,
-где работает серверная команда со своими ключами.
+рассылает уведомления и публикует итог в чате отдела. Разделить их можно ровно
+одним способом — `--no-publish`, и он НАЗЫВАЕТСЯ ЧЕЛОВЕКОМ: у отдела бывает не
+привязано группы (её может не быть по решению руководителя), и без этого флага
+разбор такого отдела не сдавался вовсе. Догадаться самому клиент не вправе —
+отдел с потерянной привязкой перестал бы получать итоги молча. Флаг `--publish`
+нужен только локальному режиму, где работает серверная команда со своими ключами.
 
 Режимы:
   --package ФАЙЛ   сдать разбор: `POST /api/pc/meeting-package?team=…`
+  --no-publish     сдать разбор БЕЗ публикации итога: задачи лягут в списки,
+                   уведомления уйдут, поста в группу не будет. Так сдаётся
+                   разбор отдела, у которого группового чата нет
   --publish-only   ТОЛЬКО досдать итог последней планёрки отдела:
                    `POST /api/pc/publish-package?team=…`. Нужен, когда пост в
                    группу ушёл наполовину или файла пакета уже нет под рукой:
@@ -40,12 +46,14 @@ require_confirmation` — она одна на обоих клиентов.
 второй раз задачи не заводит. Исправленный разбор подаётся НОВЫМ файлом —
 «одна открытая задача — одна строка», и доприменять пакет по частям нечем.
 
-Коды выхода — общие у обоих клиентов, см. `oblako_client`. Отдельно стоит
-четвёртый: пакет применён, а итог опубликован не полностью — это не успех и не
-повод повторять применение.
+Коды выхода — общие у обоих клиентов, см. `oblako_client`. Отдельно стоят
+четвёртый и пятый: пакет применён, а итог опубликован не полностью (досдать) или
+публиковать его было некуда (доделывать нечего). Ни то, ни другое не повод
+повторять применение.
 
 Примеры:
   python send_package.py --package "Разборы/13.07.26/package.json" --team Продажи
+  python send_package.py --package "…/package.json" --team "Совет управляющих" --no-publish
   python send_package.py --package "Разборы/13.07.26/package.json" --team 1 --dry-run
   python send_package.py --publish-only --team Продажи
   python send_package.py --package "…/package.json" --team 1 --local --actor 1 --publish
@@ -84,6 +92,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="досдача: дата встречи из пакета (ISO)")
     parser.add_argument("--meeting-kind", dest="meeting_kind",
                         help="досдача: вид встречи из пакета")
+    parser.add_argument("--no-publish", action="store_true", dest="no_publish",
+                        help="сдать разбор без публикации итога (у отдела нет группового чата)")
     parser.add_argument("--publish", action="store_true",
                         help="локальный режим: опубликовать итог (по ключу он публикуется всегда)")
     parser.add_argument("--local", action="store_true",
@@ -101,6 +111,15 @@ def check_args(args) -> None:
     if not args.publish_only and not args.package:
         raise client.Usage("Нечего сдавать: назови файл пакета --package <файл> "
                            "или досдай итог --publish-only")
+    # «Не публиковать» и «только опубликовать» — противоположные просьбы, как и
+    # «не публиковать» с «опубликовать» у локального режима. Молча предпочесть
+    # одну из них значило бы решить за человека.
+    if args.no_publish and args.publish_only:
+        raise client.Usage("--no-publish и --publish-only вместе не работают: "
+                           "досдача итога — это и есть публикация")
+    if args.no_publish and args.publish:
+        raise client.Usage("--no-publish и --publish вместе не работают: "
+                           "выбери одно")
     client.team(args.team)
 
 
@@ -130,7 +149,7 @@ def load_package(path: str) -> tuple[bytes, dict]:
     return raw, package
 
 
-def preview(package: dict, team: str, where: str) -> str:
+def preview(package: dict, team: str, where: str, no_publish: bool = False) -> str:
     """Что уедет — словами, без отправки. Ответ на `--dry-run`.
 
     ПРЕВЬЮ МЕСТНОЕ И НИЧЕГО НЕ ПРОВЕРЯЕТ. Прежний `-DryRun` звал
@@ -146,8 +165,13 @@ def preview(package: dict, team: str, where: str) -> str:
     for item in items:
         by_op[str(item.get("op", "?"))] = by_op.get(str(item.get("op", "?")), 0) + 1
     parts = ", ".join(f"{op}: {count}" for op, count in sorted(by_op.items())) or "пусто"
+    # Публикация — часть того, «что уедет»: молчание о ней превратило бы
+    # превью в полуправду ровно там, где человек её и проверяет.
+    publication = ("Итог в группу публиковать не будем (--no-publish)."
+                   if no_publish else "Итог уйдёт в групповой чат отдела.")
     return (f"Уехало бы: {meeting.get('kind', 'встреча')} {meeting.get('date', '')} · "
             f"отдел «{team}» · пунктов {len(items)} ({parts})\n"
+            f"{publication}\n"
             f"Адрес: {where}\n"
             f"Ничего не отправлено (--dry-run); пакет проверит сервер при отправке.")
 
@@ -162,6 +186,10 @@ def publication_lines(publication: dict, team: str) -> tuple[list, int]:
     публиковать нельзя в принципе: применён до блока E, снят по другому отделу
     или незнакомой версии. Подсказка про `--publish-only` здесь была бы дорогой в
     тупик — та же дверь ответит тем же отказом.
+
+    ПЯТЫЙ, `off`, — И НЕ ЛОМАЛОСЬ НИЧЕГО: публиковать не просили (`--no-publish`),
+    у отдела нет группы. Работа кончена, доделывать нечего, и код возврата у него
+    свой — иначе команда-скилл повела бы человека досдавать несуществующий итог.
     """
     status = publication.get("status")
     sent = publication.get("parts_sent", 0)
@@ -170,6 +198,11 @@ def publication_lines(publication: dict, team: str) -> tuple[list, int]:
         if publication.get("repeat"):
             return [f"Итог уже был опубликован раньше (частей: {total})."], client.EXIT_OK
         return [f"Итог опубликован в группе (частей: {total})."], client.EXIT_OK
+    if status == "off":
+        return ([f"Итог в группу не публиковали: "
+                 f"{publication.get('reason', 'публиковать не просили')}.",
+                 "Доделывать нечего: задачи в списках, уведомления разосланы."],
+                client.EXIT_NO_PUBLISH)
     if status == "partial":
         line = f"Опубликовано {sent} из {total} — загляни в группу перед повтором."
     elif status == "unknown":
@@ -211,15 +244,21 @@ def send(args, env: dict) -> int:
     url = client.base_url(env)
     raw, package = load_package(args.package)
     if args.dry_run:
-        print(preview(package, args.team, url + "/api/pc/meeting-package"))
+        print(preview(package, args.team, url + "/api/pc/meeting-package",
+                      no_publish=args.no_publish))
         return client.EXIT_OK
     # Гейт «запиши» — ДО ключа и до сети. Дверей к серверу две, и держать он
     # обязан у обеих: инструкция «пиши только в черновик» гейтом не является.
     client.require_confirmation(Path(args.package).expanduser(), args.team)
     key = client.access_key(env)
+    # Параметр публикации едет ТОЛЬКО когда человек её отменил: сервер, не
+    # знающий этой возможности, и путь по умолчанию обязаны остаться прежними.
+    query = {"team": args.team}
+    if args.no_publish:
+        query["publish"] = "0"
     body = client.call("POST", "/api/pc/meeting-package", url=url, key=key,
                        timeout=client.TIMEOUT_PACKAGE_SEC,
-                       query={"team": args.team}, body=raw)
+                       query=query, body=raw)
     lines = report_lines(body)
     team = (body.get("team") or {}).get("name") or args.team
     published, code = publication_lines(body.get("publication") or {}, team)

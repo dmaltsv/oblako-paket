@@ -46,7 +46,7 @@
     python meeting.py tasks   --date 09.08.26 [--team Т] [--force]
     python meeting.py preview --date 09.08.26
     python meeting.py confirm --date 09.08.26 --word "запиши"
-    python meeting.py send    --date 09.08.26 --team Т [--dry-run]
+    python meeting.py send    --date 09.08.26 --team Т [--dry-run] [--no-publish]
     python meeting.py publish --date 09.08.26 --team Т
 
 Коды выхода — общие у всего контура ПК, см. `oblako_client`. Команда-скилл ходит
@@ -81,7 +81,7 @@ DRAFT = "package.draft.json"
 PACKAGE = client.PACKAGE
 CONFIRMED = client.CONFIRMED
 RECEIPT = "Ответ сервера.json"
-CLOUD_NAMES = "Zoom.json"           # timeline из облака Zoom — источник имён
+CLOUD_NAMES = "Zoom.json"           # ответ Zoom-коннектора целиком — источник имён
 
 REVIEWS_DIR = "Разборы"             # папка разборов в корне рабочей копии
 AUDIO_DIR = "Аудио"                 # запасное место записи, заводит его установка
@@ -220,7 +220,14 @@ def _of_date(path: Path, when: date) -> bool:
 def find_audio(review: Path, when: date, env: dict) -> tuple:
     """(запись, где искали). Сначала папка разбора, затем папки записей.
 
-    Из нескольких кандидатов берём САМЫЙ БОЛЬШОЙ файл: у локальной записи Zoom
+    ИМЯ СИЛЬНЕЕ РАЗМЕРА — по той же причине, по какой в `_of_date` имя сильнее
+    времени файла. Дата встречи, названная в пути («2026-08-21 08.58.54 Планёрка
+    Розница»), — свидетельство о самой встрече; размер не свидетельствует ни о
+    чём. Пока правило было «просто самый большой», посторонний mp3 экранного
+    рекордера на 124 МБ в корне выигрывал у записи планёрки в соседней папке
+    Zoom, и разбор шёл по чужому файлу — молча и без единого имени (#278).
+
+    Из равных по этому признаку берём САМЫЙ БОЛЬШОЙ: у локальной записи Zoom
     рядом с `audio_only.m4a` лежат обрывки и звуковые эффекты, и «первый по
     алфавиту» однажды окажется не встречей.
     """
@@ -233,14 +240,21 @@ def find_audio(review: Path, when: date, env: dict) -> tuple:
                          if _of_date(item, when))
     if not found:
         return None, searched
-    return max(found, key=lambda item: item.stat().st_size), searched
+    return max(found, key=lambda item: (when in _named_dates(item),
+                                        item.stat().st_size)), searched
 
 
 def find_names(review: Path, audio: Path | None) -> Path | None:
-    """Источник имён говорящих: облачный `Zoom.json` или транскрипт рядом с записью.
+    """Источник имён говорящих: `Zoom.json` в папке разбора или транскрипт рядом с записью.
 
-    Оба пути равноправны (решение 3.3.16): в облаке имена лежат в timeline JSON,
-    у локальной записи Zoom — в `transcript.txt`/`.vtt` рядом с аудио.
+    Оба пути равноправны (решение 3.3.16): `Zoom.json` — ответ коннектора,
+    сохранённый агентом; у локальной записи Zoom имена бывают в
+    `transcript.txt`/`.vtt` рядом с аудио.
+
+    ФАЙЛА НЕТ — ЭТО НЕ «ИМЁН НЕТ». Имена лежат у самой встречи Zoom и тогда,
+    когда записи в облаке не было вовсе; принести их сюда может только агент
+    (`search_meetings` → `get_meeting_assets`), и об этом говорит подсказка
+    `find`. Скрипт в сеть не ходит: коннектор Zoom есть у агента, не у него.
     """
     cloud = review / CLOUD_NAMES
     if cloud.is_file():
@@ -334,7 +348,8 @@ def state(review: Path, env: dict, when: date) -> dict:
         audio, searched = find_audio(review, when, env)
 
     applied = bool(receipt) and receipt.get("exit_code") in (client.EXIT_OK,
-                                                            client.EXIT_PUBLISH_INCOMPLETE)
+                                                            client.EXIT_PUBLISH_INCOMPLETE,
+                                                            client.EXIT_NO_PUBLISH)
     if applied and package.is_file() and receipt.get("package") != digest(package):
         applied = False                      # пакет переписали — расписка не про него
 
@@ -350,6 +365,10 @@ def state(review: Path, env: dict, when: date) -> dict:
         "package": confirmed_package(review),
         "sent": applied,
         "published": applied and receipt.get("exit_code") == client.EXIT_OK,
+        # Публиковать было НЕКУДА — не «не удалось». Отдельный признак, а не
+        # `published: true`, потому что итога в группе нет и говорить обратное
+        # нельзя; и не `published: false`, потому что доделывать нечего.
+        "publish_off": applied and receipt.get("exit_code") == client.EXIT_NO_PUBLISH,
         "receipt": receipt,
     }
 
@@ -371,6 +390,9 @@ def next_step(st: dict) -> tuple:
                            'Сказал «запиши» — meeting.py confirm --word "<его слова>"')
     if not st["sent"]:
         return "send", "Отправить пакет на сервер: meeting.py send --team <отдел>"
+    if st["publish_off"]:
+        return "done", ("Разбор закончен: задачи применены, публиковать итог было "
+                        "некуда — у отдела нет группового чата. Делать нечего.")
     if not st["published"]:
         return "publish", ("Итог в группе неполон — досдать: "
                            "meeting.py publish --team <отдел>")
@@ -401,7 +423,8 @@ def cmd_status(args, env: dict) -> int:
           f"{PACKAGE if st['package'] else DRAFT}")
     print(f"  {done[st['package']]} «запиши»      {PACKAGE}")
     print(f"  {done[st['sent']]} отправлено")
-    print(f"  {done[st['published']]} итог в группе")
+    print(f"  {'—' if st['publish_off'] else done[st['published']]} итог в группе"
+          f"{'  публиковать некуда — так и сдавали' if st['publish_off'] else ''}")
     print(f"\nДальше: {what}")
     return client.EXIT_OK
 
@@ -420,8 +443,14 @@ def cmd_find(args, env: dict) -> int:
     print(f"Запись: {audio} ({audio.stat().st_size / (1024 * 1024):.0f} МБ)")
     print(f"Имена:  {names or 'источника нет — спикеры будут «Спикер N»'}")
     if not names:
-        print(f"  Имена берутся из облака Zoom (сохрани timeline в {review / CLOUD_NAMES}) "
-              f"или из transcript.txt/.vtt рядом с локальной записью.")
+        # Имена есть почти всегда — их прячет не отсутствие, а место. Пока
+        # подсказка звала только в облачные записи, локальная планёрка (обычный
+        # режим) выглядела «без источника», и агент восстанавливал восьмерых
+        # говорящих по обращениям в тексте — полчаса ручной работы (#278).
+        print(f"  Имена есть у САМОЙ ВСТРЕЧИ Zoom, даже когда записи в облаке нет: спроси "
+              f"коннектор `search_meetings` за эту дату, возьми UUID нужной встречи, вызови "
+              f"`get_meeting_assets` и сохрани ответ целиком в {review / CLOUD_NAMES}.")
+        print("  Второй источник — transcript.txt/.vtt рядом с записью, если Zoom его положил.")
     return client.EXIT_OK
 
 
@@ -708,11 +737,18 @@ def cmd_send(args, env: dict) -> int:
               f"(код {code}) — второй раз задачи не заводим.")
         if code == client.EXIT_PUBLISH_INCOMPLETE:
             print(f"Итог в группе неполон — досдать: meeting.py publish --team {team}")
+        if code == client.EXIT_NO_PUBLISH:
+            print("Итог в группу не публиковали — доделывать нечего.")
         return code
 
     argv = ["--package", str(package), "--team", team]
     if args.dry_run:
         argv.append("--dry-run")
+    # Просьба «не публиковать» едет клиенту дословно: у отдела может не быть
+    # группы по решению руководителя, и догадаться об этом ни один из двух
+    # клиентов не вправе (тикет #280).
+    if args.no_publish:
+        argv.append("--no-publish")
     code = send_package.main(argv)
     if not args.dry_run:
         write_receipt(review, package, team, code)
@@ -794,6 +830,8 @@ def _parser() -> argparse.ArgumentParser:
     send.add_argument("--team", help="отдел разбора: номер или имя (обязателен)")
     send.add_argument("--dry-run", action="store_true", dest="dry_run",
                       help="показать, что уедет, и не отправлять")
+    send.add_argument("--no-publish", action="store_true", dest="no_publish",
+                      help="не публиковать итог в группу (у отдела нет группового чата)")
 
     publish = common("publish", "досдать итог планёрки в чат отдела")
     publish.add_argument("--team", help="отдел разбора: номер или имя (обязателен)")

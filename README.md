@@ -157,6 +157,8 @@ python meeting.py tasks   --date <ДД.ММ.ГГ> [--team <отдел>]
 python meeting.py preview --date <ДД.ММ.ГГ>          превью и сверка со снимком
 python meeting.py confirm --date <ДД.ММ.ГГ> --word "запиши"
 python meeting.py send    --date <ДД.ММ.ГГ> --team <отдел>
+python meeting.py send    --date <ДД.ММ.ГГ> --team <отдел> --no-publish
+                                                       у отдела нет группы: без итога в чате
 python meeting.py publish --date <ДД.ММ.ГГ> --team <отдел>    досдать итог
 ```
 

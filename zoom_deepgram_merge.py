@@ -259,6 +259,25 @@ def map_speakers(utts, zoom, off):
     return mapping, purity
 
 
+def shared_names(mapping, forced):
+    """Имена, доставшиеся больше чем одному спикеру: [(имя, [номера])].
+
+    Zoom различает КАНАЛЫ, а не голоса. Двое за одним компьютером получают имя
+    владельца микрофона, а сидящие под безымянным аккаунтом («Пользователь
+    Zoom») — эту подпись оба. Deepgram их развёл, склейка снова свела, и
+    расшифровка выглядит целой: в ней просто нет одного человека. Молчание тут
+    дороже всего — разбор уйдёт на сервер с задачей, приписанной не тому.
+
+    Заданные вручную (`--speaker`) не считаются: человек уже развёл спикеров, и
+    повторять предупреждение значило бы кричать после того, как его услышали.
+    """
+    by_name = defaultdict(list)
+    for spk, name in mapping.items():
+        if spk not in forced:
+            by_name[name].append(spk)
+    return sorted((name, sorted(spks)) for name, spks in by_name.items() if len(spks) > 1)
+
+
 def parse_overrides(pairs):
     """['1=Анна'] -> {1: 'Анна'}.
 
@@ -361,6 +380,13 @@ def main(argv=None):
         for spk in sorted(mapping):
             mark = "задано вручную" if spk in forced else f"чистота {purity.get(spk, 0)*100:.0f}%"
             print(f"   Спикер {spk} -> {mapping[spk]}  ({mark})", flush=True)
+        for name, spks in shared_names(mapping, forced):
+            hands = " ".join(f"--speaker {s}=Имя" for s in spks)
+            print(f"   ВНИМАНИЕ: одно имя «{name}» досталось спикерам "
+                  f"{', '.join(str(s) for s in spks)} — Zoom их не различил "
+                  f"(один микрофон на двоих или безымянный аккаунт).", flush=True)
+            print(f"      Кто есть кто, видно по репликам в сыром ответе Deepgram; "
+                  f"доопредели вручную: {hands}", flush=True)
         spk_line = ", ".join(f"{s}→{mapping[s]}" for s in sorted(mapping))
         hand = " · имена вручную: " + ", ".join(sorted(set(forced.values()))) if forced else ""
         meta = (f"# Транскрипт (Deepgram + имена из Zoom)\n"
