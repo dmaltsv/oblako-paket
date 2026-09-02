@@ -39,7 +39,8 @@ from collections import defaultdict
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-from transcribe import load_api_key, MIME_BY_EXT, VIDEO_EXT  # переиспользуем ключ и таблицы форматов
+from transcribe import (load_api_key, deepgram_urlopen,  # ключ, выход в сеть
+                        MIME_BY_EXT, VIDEO_EXT)          # и таблицы форматов
 
 MAX_OFFSET = 1800  # ±30 мин: локальная запись стартует не в t0 встречи, разбег бывает большой
 
@@ -196,7 +197,7 @@ def deepgram(audio_path, model, lang):
     req = urllib.request.Request("https://api.deepgram.com/v1/listen?" + q,
                                  data=audio, method="POST",
                                  headers={"Authorization": f"Token {key}", "Content-Type": mime})
-    with urllib.request.urlopen(req, timeout=1800) as r:
+    with deepgram_urlopen(req, timeout=1800) as r:
         return json.load(r)
 
 
@@ -259,6 +260,39 @@ def map_speakers(utts, zoom, off):
     return mapping, purity
 
 
+def split_by_zoom(utts, zoom, off, spk_no, fallback, exclude=()):
+    """Имена на КАЖДУЮ реплику голоса ``spk_no`` — по Zoom, а не одно на голос.
+
+    Обратный случай к `--speaker`. Там Zoom не различил двоих (один микрофон) и
+    имя даёт человек; здесь наоборот — Zoom различает (у каждого свой аккаунт),
+    а Deepgram свёл два близких мужских голоса в один кластер. Разобранный случай
+    01.09.2026: двое говорили вперемежку весь звонок, чистота голоса вышла 83 %,
+    и пятая часть реплик уехала бы не тому.
+
+    Имя берём по наибольшему перекрытию с репликой Zoom в этот момент. Ничего
+    не пересеклось — оставляем имя голоса: пустая подпись хуже приблизительной.
+
+    ``exclude`` — имена, уже закреплённые за ДРУГИМИ голосами. Их из кандидатов
+    выкидываем: у своего голоса человек уже есть, и появиться внутри чужого он
+    может только перебивкой или огрехом Zoom. Без этого в том же разборе минута
+    речи внутри одного голоса подписывалась вторым участником, у которого свой
+    голос стоял рядом.
+    """
+    out = {}
+    for i, (a0, a1, spk, _txt) in enumerate(utts):
+        if spk != spk_no:
+            continue
+        acc = defaultdict(float)
+        for z in zoom:
+            if z["name"] in exclude:
+                continue
+            ov = overlap(a0, a1, z["start"] + off, z["end"] + off)
+            if ov > 0:
+                acc[z["name"]] += ov
+        out[i] = max(acc.items(), key=lambda kv: kv[1])[0] if acc else fallback
+    return out
+
+
 def shared_names(mapping, forced):
     """Имена, доставшиеся больше чем одному спикеру: [(имя, [номера])].
 
@@ -298,11 +332,14 @@ def hhmm(sec):
     return f"{sec // 60:02d}:{sec % 60:02d}"
 
 
-def build_md(utts, mapping, meta):
+def build_md(utts, mapping, meta, per_utt=None):
+    """``per_utt`` (номер реплики -> имя) старше ``mapping``: им подписаны голоса,
+    разобранные `--split` на нескольких человек."""
+    per_utt = per_utt or {}
     lines = [meta, ""]
     cur, buf, block_start = None, [], 0.0
-    for a0, a1, spk, txt in utts:
-        name = mapping.get(spk, f"Спикер {spk}")
+    for i, (a0, a1, spk, txt) in enumerate(utts):
+        name = per_utt.get(i) or mapping.get(spk, f"Спикер {spk}")
         if name != cur:
             if buf:
                 lines.append(f"[{hhmm(block_start)}] **{cur}:** " + " ".join(buf))
@@ -326,6 +363,9 @@ def main(argv=None):
                     help="предел поиска сдвига Zoom->аудио в секундах (по умолчанию 1800)")
     ap.add_argument("--dg-json", default=None, dest="dg_json",
                     help="файл сырого ответа Deepgram: есть — читаем его, нет — сохраняем туда")
+    ap.add_argument("--split", action="append", default=[], type=int, metavar="N",
+                    help="разобрать голос N на людей по именам Zoom пореплично "
+                         "(для тех, чьи голоса Deepgram свёл в один, а Zoom различает)")
     ap.add_argument("--speaker", action="append", default=[], metavar="N=Имя",
                     help="задать имя спикера Deepgram вручную, напр. --speaker 1=Анна "
                          "(для тех, кто говорит в чужой микрофон — Zoom их не различает)")
@@ -370,6 +410,7 @@ def main(argv=None):
     print(f"[Deepgram] реплик: {len(utts)}, спикеров: {len(set(u[2] for u in utts))}", flush=True)
 
     forced = parse_overrides(a.speaker)
+    per_utt = {}
     if zoom and utts:
         off, ov_sec = best_offset(utts, zoom, a.max_offset)
         mapping, purity = map_speakers(utts, zoom, off)
@@ -387,8 +428,24 @@ def main(argv=None):
                   f"(один микрофон на двоих или безымянный аккаунт).", flush=True)
             print(f"      Кто есть кто, видно по репликам в сыром ответе Deepgram; "
                   f"доопредели вручную: {hands}", flush=True)
+        for spk_no in a.split:
+            if spk_no not in mapping:
+                print(f"   [--split {spk_no}] такого голоса в записи нет — пропускаю.", flush=True)
+                continue
+            taken = {nm for sp, nm in mapping.items() if sp != spk_no}
+            part = split_by_zoom(utts, zoom, off, spk_no, mapping[spk_no], taken)
+            per_utt.update(part)
+            share = defaultdict(float)
+            for i, nm in part.items():
+                share[nm] += utts[i][1] - utts[i][0]
+            got = ", ".join(f"{nm} — {sec/60:.0f} мин"
+                            for nm, sec in sorted(share.items(), key=lambda kv: -kv[1]))
+            print(f"   Голос {spk_no} разобран по Zoom пореплично: {got}", flush=True)
+
         spk_line = ", ".join(f"{s}→{mapping[s]}" for s in sorted(mapping))
         hand = " · имена вручную: " + ", ".join(sorted(set(forced.values()))) if forced else ""
+        if per_utt:
+            hand += " · голоса " + ", ".join(str(n) for n in sorted(a.split)) + " разобраны по Zoom пореплично"
         meta = (f"# Транскрипт (Deepgram + имена из Zoom)\n"
                 f"Движок: Deepgram {a.model}/{a.lang} · диаризация · имена сшиты с Zoom "
                 f"по таймкодам (сдвиг {off:+d}с) · {dur/60:.0f} мин · спикеры: {spk_line}{hand}")
@@ -398,7 +455,7 @@ def main(argv=None):
                 f"Движок: Deepgram {a.model}/{a.lang} · диаризация · {dur/60:.0f} мин "
                 f"· Zoom-имена не подключены (восстанови по контексту)")
 
-    md = build_md(utts, mapping, meta)
+    md = build_md(utts, mapping, meta, per_utt)
     if len(md.strip()) < 100:
         print("ВНИМАНИЕ: пустой/короткий ответ, файл не сохранён.");  return 1
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

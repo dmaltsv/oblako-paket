@@ -73,6 +73,38 @@ MIME_BY_EXT = {
 }
 
 
+def load_proxy():
+    """Прокси для запросов к Deepgram: `DEEPGRAM_PROXY` из окружения или `.env`.
+
+    Настройка, а не «всегда напрямую» и не «всегда через системный прокси».
+    Замер 01.09.2026 на машине руководителя: прямая дорога до api.deepgram.com
+    отдаёт 8-22 КБ/с (82 МБ планёрки = больше часа), тот же файл через прокси
+    уходит на 600+ КБ/с — две минуты. При этом системные HTTPS_PROXY/HTTP_PROXY
+    брать вслепую нельзя: у коллег в установочном пакете прокси либо нет вовсе,
+    либо он служит другому, и молчаливый заворот туда 80 МБ аудио — сюрприз.
+    Отсюда отдельное имя: прокси именно для Deepgram, заданный явно.
+    """
+    proxy = os.environ.get("DEEPGRAM_PROXY")
+    if proxy is None:
+        proxy = oblako_client.settings(__file__).get("DEEPGRAM_PROXY")
+    return (proxy or "").strip() or None
+
+
+def deepgram_urlopen(req, timeout):
+    """Единственный выход в сеть к Deepgram — из этого файла и из склейки.
+
+    Задан `DEEPGRAM_PROXY` — идём через него; не задан — обычный `urlopen`,
+    то есть системные переменные окружения, как было.
+    """
+    proxy = load_proxy()
+    if not proxy:
+        return urllib.request.urlopen(req, timeout=timeout)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    return opener.open(req, timeout=timeout)
+
+
 def deepgram_transcribe(file_path, api_key=None):
     """Отправляет аудиофайл целиком в Deepgram и возвращает разобранный JSON-ответ.
     Ключ: аргумент -> переменная окружения -> ближайший `.env` вверх от скрипта
@@ -93,7 +125,7 @@ def deepgram_transcribe(file_path, api_key=None):
         headers={"Authorization": f"Token {key}", "Content-Type": mime},
     )
     # Таймаут с запасом: загрузка файла + обработка на сервере.
-    with urllib.request.urlopen(req, timeout=1800) as r:
+    with deepgram_urlopen(req, timeout=1800) as r:
         return json.load(r)
 
 
