@@ -15,6 +15,7 @@
     Deepgram        КАБИНЕТ принял ключ — а не «строка непустая»
     папки           `Разборы` и `Аудио` есть (нет — заводим тут же)
     команды агенту  указатели разложены и не устарели
+    Библиотека      клоны на месте, `origin` наш, имя автора задано
     сервер          живой ответ по ключу: адрес, ключ, права и состав разом
     версия формата  сервер и пакет говорят на одном числе
 
@@ -43,6 +44,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -65,6 +68,10 @@ VERSION_FILE = "ВЕРСИЯ"
 SAMPLE_ENV = ".env.example"
 WORK_DIRS = ("Разборы", "Аудио")
 MIN_PYTHON = (3, 10)
+GIT_TIMEOUT_SEC = 60
+"""Потолок одного вызова git. Он нужен из-за `fetch`: сеть до GitHub из России
+бывает вялой, и висеть без края проверка права не имеет — человек решит, что
+она сломалась, и убьёт её на середине."""
 
 DEEPGRAM_PROJECTS = "https://api.deepgram.com/v1/projects"
 """Самая дешёвая дверь Deepgram: список проектов кабинета. Она ничего не
@@ -93,6 +100,16 @@ class Report:
         print(f"  [нет]  {name}: {detail}")
         if fix:
             print(f"         → {fix}")
+
+    def skip(self, name: str, detail: str) -> None:
+        """Проверять нечего — и это не «ок» и не «нет».
+
+        Третий исход завёлся вместе с Библиотекой: пакет без неё целый, и
+        считать ненастроенную Библиотеку успехом значило бы хвалить то, чего
+        нет, а провалом — гнать человека настраивать необязательное. В счёт
+        «готово N из N» такая строка не идёт по той же причине.
+        """
+        print(f"  [—]    {name}: {detail}")
 
 
 def package_version() -> str:
@@ -214,6 +231,114 @@ def check_recording(report: Report, env: dict) -> None:
                f"в OBLAKO_AUDIO_DIRS")
 
 
+def git(args: list, cwd=None, timeout: int = GIT_TIMEOUT_SEC) -> tuple:
+    """Позвать git и вернуть (код возврата, вывод одной строкой).
+
+    Отсутствие git — не поломка проверки, а её находка: код 127 и пустой вывод,
+    а объясняет находку тот, кто спрашивал. Своё исключение здесь развалило бы
+    весь прогон на машине, где git ещё не поставили, — а поставить его как раз и
+    есть шаг мастера.
+
+    `GIT_TERMINAL_PROMPT=0` — обязательный намордник. Без него `git fetch` в
+    репозиторий, куда человека ещё не позвали, ВСТАЁТ и молча ждёт логин с
+    паролем: проверка выглядит зависшей, а на самом деле ждёт ввода, которого в
+    этом окне не будет.
+    """
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        done = subprocess.run(["git", *args], cwd=str(cwd) if cwd else None,
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout, env=environment)
+    except FileNotFoundError:               # git не поставлен вовсе
+        return 127, ""
+    except subprocess.TimeoutExpired:       # сеть встала — не ждём дольше края
+        return 124, ""
+    return done.returncode, ((done.stdout or "") + (done.stderr or "")).strip()
+
+
+def check_library(report: Report, env: dict, offline: bool) -> None:
+    """Клоны Библиотеки и имя автора коммитов.
+
+    БИБЛИОТЕКА НЕОБЯЗАТЕЛЬНА. Пакет без неё разбирает планёрки ровно как прежде,
+    поэтому ненастроенная Библиотека — не «нет», а третий исход (`Report.skip`):
+    гнать руководителя отдела настраивать то, чем он не пользуется, значит
+    научить его пропускать красные строки — и пропустит он заодно отозванный
+    ключ.
+
+    ЧТО СПРАШИВАЕТСЯ У КАЖДОГО АДРЕСА, И ПОЧЕМУ ИМЕННО ЭТО:
+
+        клон на месте    папка есть и внутри `.git` — иначе писать некуда
+        `origin` тот     клон ведёт в НАШ репозиторий, а не в чужой с тем же
+                         именем: перепутанный `origin` отдаёт работу человека
+                         не туда, и промах молчаливый
+        сеть отвечает    `git fetch --dry-run` — живой ответ вместо «на вид
+                         настроено»: снятому с репозитория человеку клон
+                         выглядит исправным ровно до первой отправки
+
+    `--offline` спрашивает только первые два: проверку зовут и там, где
+    интернета нет вовсе, и тогда она обязана отвечать про машину, а не про сеть.
+
+    ИМЯ АВТОРА — часть Библиотеки, а не украшение. История правок в ней и есть
+    ответ на вопрос «кто это решил»; коммит без имени человека делает историю
+    бесполезной ровно в тот день, когда её впервые спросят. Спрашивается оно у
+    того же git и в той же папке, где будут коммиты, — глобальная настройка,
+    перебитая локальной, иначе показывала бы не то имя, которым подпишется работа.
+
+    АДРЕСА НЕ ПЕЧАТАЮТСЯ — только имена репозиториев. Токенов в них не бывает
+    (доступ даёт `gh auth login`), но вывод переживает сессию в истории
+    терминала, и правило «в консоль уходит имя, а не адрес» дешевле проверки
+    каждого нового адреса на то, что в него вписали.
+    """
+    urls = client.library_urls(env)
+    if not urls:
+        report.skip("Библиотека", "не настроена")
+        return
+
+    folder = client.library_dir(HOME, env)
+    ready, clones = [], []
+    for url in urls:
+        name = client.library_name(url)
+        clone = folder / name
+        if not (clone / ".git").exists():
+            report.bad(f"Библиотека: {name}", f"клона нет в {folder}",
+                       f"скажи агенту «настрой пакет» — он клонирует Библиотеку; "
+                       f"сам: git clone <адрес из {client.LIBRARY_URLS_ENV}> "
+                       f"\"{clone}\"")
+            continue
+        code, said = git(["-C", str(clone), "remote", "get-url", "origin"])
+        if code == 127:
+            report.bad("Библиотека", "git не найден",
+                       "поставь git: Windows — winget install --id Git.Git -e, "
+                       "macOS — brew install git")
+            return
+        if code != 0 or client.library_slug(said) != client.library_slug(url):
+            report.bad(f"Библиотека: {name}", "клон ведёт в другой репозиторий",
+                       f"удали папку {clone} и клонируй заново")
+            continue
+        if not offline:
+            code, _ = git(["-C", str(clone), "fetch", "--dry-run", "origin"])
+            if code != 0:
+                report.bad(f"Библиотека: {name}", "сервер не отвечает или доступа нет",
+                           "проверь связь; не проходит — попроси владельца позвать "
+                           "тебя в репозиторий и сделай gh auth login")
+                continue
+        clones.append(clone)
+        ready.append(name)
+
+    if ready:
+        report.ok("Библиотека доступна", ", ".join(ready))
+
+    # Имя автора спрашивается в папке ПЕРВОГО клона: там будут коммиты, и
+    # локальная настройка репозитория обязана быть видна. Клонов нет — вопрос
+    # тот же, но к глобальной настройке.
+    code, said = git(["config", "user.name"], cwd=clones[0] if clones else HOME)
+    if code == 0 and said.strip():
+        report.ok("Имя автора задано", said.strip())
+        return
+    report.bad("Имя автора задано", "нет — коммиты будут без человека",
+               'git config --global user.name "Имя, как в Oblako"')
+
+
 # ---------------------------------------------------------------------------
 # Проверки сети
 # ---------------------------------------------------------------------------
@@ -303,6 +428,7 @@ def main(argv=None) -> int:
         check_folders(report)
         check_skills(report)
         check_recording(report, env)
+        check_library(report, env, args.offline)
         if args.offline:
             print("  [—]    Сеть не проверялась (--offline)")
         else:

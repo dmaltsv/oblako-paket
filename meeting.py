@@ -98,15 +98,9 @@ DEFAULT_AUDIO_DIRS = ("~/Documents/Zoom", "~/Zoom", "~/Downloads", "~/Загру
 # единого имени говорящего — молча и правдоподобно.
 NAME_SOURCES = ("*.vtt", "transcript.txt", "closed_caption.txt")
 
-# Слово-команда человека. Формы ТОЛЬКО ПОВЕЛИТЕЛЬНЫЕ, а не общий стебель «запиш»:
-# «я сам запишу» и «запишем потом» — не поручение агенту, а разговор о себе, и
-# по стеблю они прошли бы за команду. Одно и то же решение, сказанное по-разному
-# («запиши», «запишите», «записывай»), при этом принимается.
-COMMAND = r"(запиши(те)?|записывай(те)?)"
-CONFIRM_WORD = re.compile(rf"\b{COMMAND}\b", re.IGNORECASE)
-# Отрицание считается ТОЛЬКО непосредственно перед словом-командой: «не
-# записывай» — отказ, а «запиши, но не Борису» — законная команда с оговоркой.
-CONFIRM_DENIED = re.compile(rf"\bне\s+{COMMAND}\b", re.IGNORECASE)
+# Слово человека судит `oblako_client.confirmed_by` — тот же судья, что у записи
+# в Библиотеку (`library.py put`). Копии правила здесь нет намеренно: разойдясь,
+# две копии дали бы одному сказанному слову два разных смысла.
 
 OP_MARK = {"add": "➕", "close": "✅", "edit": "✏️"}
 OP_TITLE = {"add": "Новые", "close": "Закрыть", "edit": "Править"}
@@ -620,30 +614,10 @@ def cmd_preview(args, env: dict) -> int:
     return client.EXIT_OK
 
 
-def confirmed_by(word: str) -> None:
-    """Гейт «запиши»: пропускает только явную команду человека.
-
-    Слово приезжает СЛОВАМИ ЧЕЛОВЕКА, а не признаком «агент решил, что можно».
-    Пересказ можно сделать любым, а «ок» вместо «запиши» отсюда не проходит —
-    это и есть первый пояс от инцидента 14.07 на дороге разбора планёрки.
-    """
-    said = (word or "").strip()
-    if not said:
-        raise client.Usage('Гейт «запиши»: не сказано ничего. Передай слова человека: '
-                           '--word "запиши"')
-    if CONFIRM_DENIED.search(said):
-        raise client.Usage(f'Это отказ, а не команда: «{said}». В чужой список ничего не уходит.')
-    if not CONFIRM_WORD.search(said):
-        raise client.Usage(
-            f'«{said}» командой не считается — нужно слово «запиши».',
-            ['«ок», «понял», «хорошо», «согласен» — это не команда записи',
-             'пока человек не сказал «запиши», в чужой список не уезжает ни одна задача'])
-
-
 def cmd_confirm(args, env: dict) -> int:
     review = folder_for(args)
     draft, package = review / DRAFT, review / PACKAGE
-    confirmed_by(args.word)
+    client.confirmed_by(args.word)
     if not draft.is_file():
         if confirmed_package(review):
             print(f"[Пропуск] пакет уже подтверждён: {package}")
