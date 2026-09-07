@@ -163,6 +163,9 @@ AUTOMATON_SIGN = "Автомат: {name}"
 # на которых спотыкается файловая система Windows.
 FORBIDDEN_IN_NAME = re.compile(r"[\\/:*?\"<>|]")
 
+# Название встречи без имени — файл всё равно нужен, и он ложится под этим словом.
+NAMELESS = "встреча"
+
 # --- git --------------------------------------------------------------------
 GIT_TIMEOUT_SEC = 120                   # молчащая сеть не должна вешать скрипт навсегда
 PUSH_TRIES = 3                          # при отставании: забрать чужое и повторить
@@ -513,13 +516,41 @@ def library_date(stated) -> date:
          f"или {date.today().strftime(ISO_DATE)}"])
 
 
-def safe_part(value, flag: str, what: str) -> str:
-    """Часть имени файла, названная человеком. Путём она быть не может."""
+def clean_name(value) -> str:
+    """Название документа, годное для имени файла. ОДНО ПРАВИЛО НА ВЕСЬ ПАКЕТ.
+
+    Запрещённые файловой системой знаки заменяются пробелом, пробелы
+    схлопываются, пустое название становится `NAMELESS`. Отказаться нельзя: у
+    автомата (`avtomat.title_of`) нет человека, у которого спросить, и слэш в
+    названии встречи стоил бы всей расшифровки.
+
+    ЖИВЁТ ЗДЕСЬ, ПОТОМУ ЧТО ПРАВИЛ БЫЛО ДВА. Автомат чистил название, а `put`
+    ровно те же знаки ОТВЕРГАЛ — и человек, которому «Планёрка: Розница/север»
+    записать не дали, клал файл под самопридуманным именем. Следующий разбор
+    ищет по правилу автомата, чужого имени не находит и платит Deepgram второй
+    раз за тот же час. Правило пути в Библиотеке одно, и правило имени — тоже.
+    """
+    said = FORBIDDEN_IN_NAME.sub(" ", str(value or "").strip())
+    said = " ".join(said.split())
+    return NAMELESS if said in ("", ".", "..") else said
+
+
+def safe_part(value, flag: str, what: str, clean: bool = False) -> str:
+    """Часть имени файла, названная человеком. Путём она быть не может.
+
+    `clean` — чистить, а не отвергать (`clean_name`). Так принимается название
+    документа: его человек берёт из названия встречи, где двоеточие и слэш дело
+    обычное. Отдел и автор чистке не подлежат: они называют СУЩЕСТВУЮЩЕЕ — папку
+    отдела и человека в Oblako, — и «почищенное» имя молча завело бы рядом
+    вторую папку.
+    """
     said = (value or "").strip()
     if not said:
         raise client.Usage(
             f"Не назван {what}: {flag} «…»",
             ["без него правило пути не даёт имени файла — угадывать система не вправе"])
+    if clean:
+        return clean_name(said)
     if said in (".", "..") or FORBIDDEN_IN_NAME.search(said):
         raise client.Usage(
             f"{flag}: «{said}» — это путь, а не {what}",
@@ -553,7 +584,7 @@ def place(repo: Repo, kind: str, when: date, args) -> tuple:
                                    "автор (имя, как в Oblako)")
     if rule["needs"] == "title":
         fields["title"] = safe_part(getattr(args, "title", None), "--title",
-                                    "название документа")
+                                    "название документа", clean=True)
     inside = rule["path"].format(**fields)
     target = inside if repo.root_level else f"{TEAMS_DIR}/{team}/{inside}"
     return target, rule["message"].format(**fields)
@@ -840,6 +871,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    """Настройки — из `.env` рядом со скриптами, а поверх него из окружения.
+
+    Правило одно на весь пакет и живёт в `oblako_client.settings`: в облачной
+    машине рутины `.env` нет вовсе, и Библиотека берёт свои адреса оттуда же,
+    откуда их берут остальные скрипты. Своего способа читать настройки — в том
+    числе «пусть назовёт вызывающий» — у команды Библиотеки нет.
+    """
     client.setup_console()
     args = _parser().parse_args(argv)
     env = client.settings(SCRIPT)

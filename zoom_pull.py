@@ -10,6 +10,8 @@
     python zoom_pull.py --list --date 11.08.26   что есть в облаке за день
     python zoom_pull.py --date 11.08.26 --at 08:55   забрать эту встречу
     python zoom_pull.py --json --days 7          то же самое для агента
+    python zoom_pull.py --meeting <uuid> --json  звук и транскрипт Zoom ЭТОГО
+                                                 экземпляра встречи (#450, автомат)
 
 ═══ ЗАЧЕМ ═══
 
@@ -54,6 +56,38 @@
 облаке — скрипт говорит об этом прямо и называет настройку Zoom, которая её
 включает: гадать за человека и тащить видео он не станет.
 
+═══ ПО ЭКЗЕМПЛЯРУ ВСТРЕЧИ, А НЕ ПО ДАТЕ (#450) ═══
+
+Автомат (`avtomat.py`, #455) знает не дату, а саму встречу: сервер прислал ему
+номер и uuid экземпляра из события Zoom. Дата здесь ненадёжна вдвойне: у серии
+номер один на все дни, а за день бывает несколько записей — и правило «не
+выбирать самому» оставило бы автомат без записи. Поэтому `--meeting <uuid или
+номер>` спрашивает у Zoom файлы ИМЕННО ЭТОГО экземпляра (`GET
+/meetings/{id}/recordings`): по uuid — тот самый день серии, по номеру — то,
+что Zoom считает последней записью встречи с этим номером.
+
+Кладутся ДВА файла под одним именем: звук `GMT…_Recording.m4a` и транскрипт
+Zoom `GMT…_Recording.vtt` рядом. Одно имя — не красота: `meeting.find_names`
+ищет имена говорящих в `*.vtt` рядом с записью, и пара с общим корнем имени
+находится как одна запись даже в общей папке с десятком прошлых планёрок.
+Транскрипта в облаке нет (Zoom его не включил или ещё не дописал — он
+появляется ПОЗЖЕ звука) — скрипт говорит об этом прямо и заканчивает кодом 0:
+звук есть, разбор пойдёт без имён, и это не отказ.
+
+Что есть транскрипт в списке файлов записи, сверено по документации Zoom, а не
+по памяти (Developer Docs, «Cloud recording» и ручка «Get meeting recordings»;
+Developer Blog «Meeting API querying tips, part 1»):
+  · звук — `recording_type: "audio_only"`, `file_type: "M4A"`;
+  · транскрипт — `recording_type: "audio_transcript"`, `file_type:
+    "TRANSCRIPT"`, `file_extension: "VTT"`; включается у хозяина настройкой
+    «Audio transcript» облачной записи и приходит отдельным файлом;
+  · uuid экземпляра кодируется в пути ДВАЖДЫ, если начинается с «/» или
+    содержит «//», иначе Zoom отвечает «Meeting does not exist» (`meeting_path`).
+
+`--dry-run` не ходит в сеть вовсе — ни за токеном, ни за списком: печатает,
+куда лягут файлы и какой путь спросит у Zoom. Так автомат проверяют на машине
+без ключа, и так же `send_package.py --dry-run` живёт без ключа сервера.
+
 ═══ КЛЮЧ ═══
 
 Тот же ключ Server-to-Server OAuth, что и у остального контура Zoom, — три
@@ -68,12 +102,31 @@
 
 ═══ КОДЫ ВОЗВРАТА — КАК У КОНТУРА ПК ═══
 
-0 сделано · 1 не с чем работать · 2 сервер отказал · 3 сервер не ответил.
-Те же четыре значения и в том же смысле, что у `Пакет/oblako_client.py`: разбор
-встречи ведёт одна и та же рука, и второй словарь кодов ей пришлось бы держать в
-голове отдельно. Поэтому своя беда (нет ключа в `.env`, не разобрана команда,
-за день несколько записей) — это код 1, а не 2: код 2 говорит «чини Zoom», и
-человек с агентом ушли бы чинить исправное.
+0 сделано · 1 не с чем работать · 2 сервер отказал · 3 сервер не ответил ·
+6 записи этой встречи в облаке ещё нет.
+Первые четыре значения — те же и в том же смысле, что у
+`Пакет/oblako_client.py`: разбор встречи ведёт одна и та же рука, и второй
+словарь кодов ей пришлось бы держать в голове отдельно. Поэтому своя беда (нет
+ключа в `.env`, не разобрана команда, за день несколько записей) — это код 1, а
+не 2: код 2 говорит «чини Zoom», и человек с агентом ушли бы чинить исправное.
+
+ШЕСТОЙ КОД — СВОЙ, И ОН НЕ УКРАШЕНИЕ. «Записи ещё нет» (Zoom отвечает 404 на
+`/meetings/<экземпляр>/recordings`) и «Zoom отказал» — РАЗНЫЕ беды с разным
+лечением: первая проходит сама через несколько минут, вторая сама не пройдёт
+никогда (мёртвый ключ, отозванные права, 429, переброс за пределы Zoom). Слитые
+в один код 2, они заставляли автомат (`avtomat.py`) звать «записи ещё нет» ЛЮБОЙ
+отказ облака: до одиннадцати холостых запусков облачной рутины подряд, а
+человеку в конце — ложная причина «записи встречи не было». Номер взят шестой, а
+не четвёртый: 4 и 5 в контуре ПК уже заняты исходами пакета встречи
+(`oblako_client.EXIT_PUBLISH_INCOMPLETE`, `EXIT_NO_PUBLISH`), и второй смысл у
+того же числа сбил бы и человека, и агента.
+
+НО НЕ ВСЯКИЙ 404 — ЭТО КОД 6. Тем же 404 Zoom отвечает и на «Meeting does not
+exist» (`code 3001`): опечатка в номере комнаты, uuid чужого аккаунта, встреча,
+которой в облаке нет вовсе. Ожиданием это не лечится никогда, а код 6 велит
+именно ждать — и разбор встал бы в вечный круг. Тела ответов разводит
+`no_such_meeting`: «нет такого экземпляра» уезжает кодом 2 («зовите человека»),
+и только «запись ещё дописывается» (`code 3301`) остаётся кодом 6.
 """
 from __future__ import annotations
 
@@ -81,7 +134,7 @@ import argparse
 import base64
 import http.client
 import json
-import os
+import re
 import ssl
 import sys
 import urllib.error
@@ -95,6 +148,7 @@ import oblako_client as client
 SCRIPT = Path(__file__).resolve()
 
 OK, NOTHING, REFUSED, SILENT = 0, 1, 2, 3
+NO_RECORDING = 6             # записи этой встречи в облаке ещё нет (см. шапку)
 
 AUDIO_DIR = "Аудио"          # то же имя, что знает `Пакет/meeting.py`
 AUDIO_DIRS_ENV = "OBLAKO_AUDIO_DIRS"   # и та же настройка, тем же разделителем
@@ -105,6 +159,12 @@ MSK = timezone(timedelta(hours=3))
 
 TOKEN_URL = "https://zoom.us/oauth/token"
 API = "https://api.zoom.us/v2"
+
+# Один текст на оба режима (по дате и по экземпляру): беда одна, лечение одно.
+NO_AUDIO = ("У этой записи нет отдельной звуковой дорожки — облако писало только видео,\n"
+            "а расшифровка видео не принимает.\n"
+            "Лечится в настройках Zoom: Запись → Облачные записи → «Запись только звука».\n"
+            "Уже записанную встречу это не исправит, поможет только следующей.")
 
 # Обрыв связи посреди чтения ответа прилетает четырьмя разными видами, и общего
 # предка у них нет: `IncompleteRead` — из `http.client`, `SSLError` — из `ssl`,
@@ -118,7 +178,28 @@ class Usage(Exception):
 
 
 class Refused(Exception):
-    """Zoom ответил отказом. Текст ответа несём целиком — в нём причина."""
+    """Zoom ответил отказом. Текст ответа несём целиком — в нём причина.
+
+    `status` — код HTTP, которым Zoom отказал (у отказов, придуманных здесь, его
+    нет). Он нужен не для журнала: по нему «записи ещё нет» отделяется от
+    «мёртвый ключ», а на этой развилке держится вся работа автомата.
+    """
+
+    def __init__(self, message, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class NoRecording(Refused):
+    """Записи этого экземпляра встречи в облаке ещё нет — Zoom ответил 404.
+
+    ОТДЕЛЬНАЯ БЕДА, А НЕ ОТТЕНОК ОТКАЗА. Облако дописывает запись через
+    несколько минут после конца встречи, и до этого её ручка отвечает «This
+    recording does not exist». Лечение здесь одно — подождать и повторить;
+    у остальных отказов Zoom (401, 429, отозванные права, переброс за пределы
+    Zoom) ожидание не лечит ничего, и путать их нельзя: автомат по первой беде
+    возвращается позже сам, а по второй зовёт человека.
+    """
 
 
 class Silent(Exception):
@@ -163,25 +244,20 @@ def _open(request: urllib.request.Request, timeout: int = TIMEOUT):
         return OPENER.open(request, timeout=timeout)
     except urllib.error.HTTPError as err:
         body = err.read().decode("utf-8", "replace")[:500]
-        raise Refused(f"Zoom ответил {err.code}: {body}") from None
+        raise Refused(f"Zoom ответил {err.code}: {body}", status=err.code) from None
     except (urllib.error.URLError, *BROKEN) as err:
         raise Silent(f"Zoom не ответил: {err}") from None
 
 
 def load_env() -> dict:
-    """Настройки из `.env` рядом со скриптами; окружение важнее файла.
+    """Настройки скрипта. Имя своё, правило общее — `oblako_client.settings`.
 
-    ТО ЖЕ ПРАВИЛО, ЧТО У СЕРВЕРА (`bot.load_env`) И У ОСТАЛЬНОГО ПАКЕТА
-    (`oblako_client.settings`): один и тот же файл обязан пониматься одинаково с
-    обеих сторон, иначе ключ, работающий на разборе, «не работает» на скачивании.
-    Потолок поиска `.env` держит клиент — в клоне пакета это его корень, и чужой
-    файл этажом выше не подхватывается молча.
+    Правило («`.env` рядом со скриптами, а поверх него окружение») живёт в
+    клиенте и одно на весь пакет: один и тот же файл обязан пониматься одинаково
+    всеми скриптами, иначе ключ, работающий на разборе, «не работает» на
+    скачивании. Здесь остаётся только имя — его знают вызывающие и тесты.
     """
-    env = client.settings(SCRIPT)
-    for name, value in os.environ.items():
-        if value:
-            env[name] = value
-    return env
+    return client.settings(SCRIPT)
 
 
 def access_token(env: dict) -> str:
@@ -262,6 +338,70 @@ def recordings(token: str, since: date, upto: date) -> list:
     return sorted(found, key=lambda item: item.get("start_time") or "", reverse=True)
 
 
+def meeting_path(ref: str) -> str:
+    """Экземпляр встречи в пути ручки Zoom: номер как есть, uuid — закодированный.
+
+    Правило Zoom (Developer Blog «Meeting API querying tips, part 1»): uuid,
+    который начинается с «/» или содержит «//», кодируется ДВАЖДЫ — то есть
+    кодируется результат первого кодирования, а не приписывается второй раз.
+    Иначе ответ — «Meeting does not exist», и автомат прочитал бы его как
+    «записи нет» у встречи, которая есть.
+    """
+    ref = ref.strip()
+    if ref.isdigit():
+        return ref
+    once = urllib.parse.quote(ref, safe="")
+    if ref.startswith("/") or "//" in ref:
+        return urllib.parse.quote(once, safe="")
+    return once
+
+
+def no_such_meeting(refusal: Refused) -> bool:
+    """Тот ли это 404: «встречи с таким адресом нет» — или «записи ещё нет».
+
+    Zoom отвечает 404 на ОБЕ беды, и различает их только тело ответа: `code
+    3301` («This recording does not exist») — облако ещё дописывает запись,
+    ждать имеет смысл; `code 3001` («Meeting does not exist») — названного
+    экземпляра нет вовсе, и ожидание не вылечит это НИКОГДА. Опечатка в номере
+    комнаты, uuid чужого аккаунта, встреча, которую не писали в облако, — это
+    второй случай, и ответ «повтори позже» ставит разбор в вечный круг
+    ожидания: автомат по коду 6 возвращается сам, а скилл велит агенту ждать.
+
+    НЕИЗВЕСТНОЕ ТЕЛО СЧИТАЕТСЯ «ЗАПИСИ ЕЩЁ НЕТ» — так вёл себя скрипт до этой
+    развилки. Живых тел Zoom здесь не снимали, разделение взято из его
+    документации; ошибиться в сторону ожидания дешевле, чем сломать работающий
+    путь ради ответа, которого мы не опознали.
+    """
+    text = str(refusal).lower()
+    return "meeting does not exist" in text or re.search(r'"code"\s*:\s*3001', text) is not None
+
+
+def instance(token: str, ref: str) -> dict:
+    """Файлы записи одного экземпляра встречи — той же формы, что элемент списка.
+
+    Zoom отдаёт ту же карточку (`uuid`, `id`, `topic`, `start_time`,
+    `recording_files`), что и `recordings`, поэтому дальше её ведут те же
+    `audio_track`, `file_name`, `describe` — второго пути по облаку нет.
+
+    404 ЗДЕСЬ БЫВАЕТ ДВУХ СМЫСЛОВ, и путать их нельзя: «облако ещё дописывает
+    запись» лечится ожиданием, «такого экземпляра нет» — только человеком,
+    который назовёт верный адрес; судит их `no_such_meeting` по телу ответа.
+    Отделяется беда ЗДЕСЬ, у единственной ручки, которая спрашивает конкретный
+    экземпляр: у списка записей (`recordings`) 404 значил бы совсем другое —
+    «нет такого аккаунта».
+    """
+    try:
+        return api_get(f"/meetings/{meeting_path(ref)}/recordings", token)
+    except Refused as refusal:
+        if refusal.status != 404 or no_such_meeting(refusal):
+            raise
+        raise NoRecording(
+            f"Записи этой встречи в облаке Zoom ещё нет. {refusal}\n"
+            f"Облако дописывает запись не сразу — обычно через несколько минут "
+            f"после конца встречи. Повтори позже."
+        ) from None
+
+
 def started_msk(meeting: dict):
     """Начало встречи по Москве. Zoom говорит временем UTC с буквой Z."""
     stamp = (meeting.get("start_time") or "").replace("Z", "+00:00")
@@ -284,13 +424,32 @@ def audio_track(meeting: dict):
     return max(tracks, key=lambda item: item.get("file_size") or 0) if tracks else None
 
 
+def transcript_track(meeting: dict, audio: dict | None):
+    """Транскрипт Zoom к звуковой дорожке: `audio_transcript` (VTT) — или ничего.
+
+    Запись ставили на паузу — транскриптов столько же, сколько дорожек звука, и
+    парой к выбранной дорожке считается тот, что начался вместе с ней. Пары по
+    времени нет — берётся самый большой, по тому же доводу, что у `audio_track`.
+    Вид файла — по документации Zoom: `recording_type: "audio_transcript"`,
+    `file_type: "TRANSCRIPT"`, расширение VTT.
+    """
+    found = [item for item in meeting.get("recording_files") or []
+             if item.get("recording_type") == "audio_transcript" and item.get("download_url")]
+    if not found:
+        return None
+    start = (audio or {}).get("recording_start")
+    paired = [item for item in found if start and item.get("recording_start") == start]
+    return max(paired or found, key=lambda item: item.get("file_size") or 0)
+
+
 def describe(meeting: dict) -> str:
     """Строка про встречу для глаза: когда, о чём, есть ли звук отдельно."""
     when = started_msk(meeting)
     stamp = when.strftime("%d.%m.%y %H:%M") if when else "время неизвестно"
     track = audio_track(meeting)
     size = f"{round((track.get('file_size') or 0) / 1048576)} МБ" if track else "звука нет"
-    return f"{stamp}  «{meeting.get('topic') or 'без темы'}»  {size}"
+    names = ", транскрипт Zoom есть" if transcript_track(meeting, track) else ""
+    return f"{stamp}  «{meeting.get('topic') or 'без темы'}»  {size}{names}"
 
 
 def as_data(meeting: dict) -> dict:
@@ -299,11 +458,13 @@ def as_data(meeting: dict) -> dict:
     track = audio_track(meeting)
     return {
         "id": str(meeting.get("id") or ""),
+        "uuid": meeting.get("uuid") or "",
         "topic": meeting.get("topic") or "",
         "date": when.strftime(DATE_FMT) if when else None,
         "at": when.strftime("%H:%M") if when else None,
         "size_mb": round((track.get("file_size") or 0) / 1048576) if track else 0,
         "has_audio": track is not None,
+        "has_transcript": transcript_track(meeting, track) is not None,
     }
 
 
@@ -407,7 +568,7 @@ def target_dir(env: dict, stated) -> Path:
 # ---------------------------------------------------------------------------
 # Скачивание
 # ---------------------------------------------------------------------------
-def download(track: dict, target: Path, token: str) -> None:
+def download(track: dict, target: Path, token: str, quiet: bool = False) -> None:
     """Дорожка → файл. Качаем в `.part` и переименовываем в самом конце.
 
     ПОЛОВИНА ЗАПИСИ НЕ СТАНОВИТСЯ ЗАПИСЬЮ. Оборванное чтение `read()` возвращает
@@ -436,8 +597,10 @@ def download(track: dict, target: Path, token: str) -> None:
                     break
                 sink.write(chunk)
                 got += len(chunk)
-                print(f"\r  качаю… {got / 1048576:.0f} МБ", end="", flush=True)
-        print()
+                if not quiet:
+                    print(f"\r  качаю… {got / 1048576:.0f} МБ", end="", flush=True)
+        if not quiet:
+            print()
     except BROKEN as err:
         raise Silent(f"Связь оборвалась на {got / 1048576:.0f} МБ: {err}\n"
                      f"Недокачанное осталось в {part.name} — просто повтори.") from None
@@ -462,12 +625,89 @@ def parse_args(argv):
                         help="машинный вид списка — для агента")
     parser.add_argument("--force", action="store_true", help="скачать заново поверх готового файла")
     parser.add_argument("--to", help="папка для записи (по умолчанию — первая из OBLAKO_AUDIO_DIRS)")
+    parser.add_argument("--meeting", metavar="UUID|НОМЕР",
+                        help="экземпляр встречи: звук и транскрипт Zoom именно его, без выбора по дате")
+    parser.add_argument("--dry-run", action="store_true", dest="dry_run",
+                        help="с --meeting: показать, куда лягут файлы, в сеть не ходить")
     return parser.parse_args(argv)
+
+
+def fetch_pair(meeting: dict, folder: Path, token: str, force: bool, quiet: bool) -> dict:
+    """Звук и транскрипт экземпляра → два файла с одним корнем имени.
+
+    Возвращает, что вышло: пути и слово «why» про транскрипт, если его нет.
+    Готовый файл того же размера второй раз не качается — как и в режиме по дате.
+    `quiet` — для `--json`: агент читает вывод целиком как JSON, и строка
+    «качаю… 12 МБ» посреди него сломала бы разбор ответа.
+    """
+    say = (lambda text: None) if quiet else print
+    audio = audio_track(meeting)
+    if audio is None:
+        raise Usage(NO_AUDIO)
+    names = transcript_track(meeting, audio)
+    target = folder / file_name(meeting, audio)
+    folder.mkdir(parents=True, exist_ok=True)
+    got = {"audio": target, "transcript": None, "why": None}
+    for track, path in ((audio, target), (names, target.with_suffix(".vtt"))):
+        if track is None:
+            continue
+        size = track.get("file_size") or 0
+        if path.exists() and not force and size and path.stat().st_size == size:
+            say(f"Уже здесь: {path}")
+        else:
+            download(track, path, token, quiet)
+            say(f"Готово: {path}")
+        if track is names:
+            got["transcript"] = path
+    if names is None:
+        got["why"] = ("Транскрипта Zoom у этой записи нет: облако его не включило или ещё "
+                      "не дописало (он появляется позже звука). Имена говорящих не сшить — "
+                      "расшифровка пойдёт без них; повторный запуск заберёт транскрипт, "
+                      "когда он появится.")
+        say(got["why"])
+    return got
+
+
+def run_meeting(args, env: dict) -> int:
+    """Режим `--meeting`: файлы одного экземпляра встречи, а не выбор по дате."""
+    folder = target_dir(env, args.to)
+    if args.dry_run:
+        plan = {"meeting": args.meeting, "path": f"/meetings/{meeting_path(args.meeting)}/recordings",
+                "folder": str(folder), "dry_run": True}
+        if args.as_json:
+            print(json.dumps(plan, ensure_ascii=False, indent=2))
+        else:
+            print(f"Спросил бы у Zoom {plan['path']} и положил бы звук с транскриптом в "
+                  f"{folder}.\nНичего не скачано (--dry-run), в сеть не ходил.")
+        return OK
+    token = access_token(env)
+    meeting = instance(token, args.meeting)
+    if args.list:
+        if args.as_json:
+            print(json.dumps({"meeting": as_data(meeting)}, ensure_ascii=False, indent=2))
+        else:
+            print("Встреча: " + describe(meeting))
+        return OK
+    if not args.as_json:
+        print("Встреча: " + describe(meeting))
+    got = fetch_pair(meeting, folder, token, args.force, quiet=args.as_json)
+    if args.as_json:
+        print(json.dumps({"meeting": as_data(meeting), "audio": str(got["audio"]),
+                          "transcript": str(got["transcript"]) if got["transcript"] else None,
+                          "note": got["why"]}, ensure_ascii=False, indent=2))
+    return OK
 
 
 def run(argv) -> int:
     args = parse_args(argv)
     env = load_env()
+    if args.meeting:
+        if args.date or args.at:
+            raise Usage("--meeting называет встречу сам: --date и --at с ним не нужны.")
+        return run_meeting(args, env)
+    if args.dry_run:
+        raise Usage("--dry-run есть только у --meeting: режим по дате и так ничего не "
+                    "качает без выбора (`--list`).")
     day = wanted_day(args.date)
     at = wanted_time(args.at)
 
@@ -498,10 +738,7 @@ def run(argv) -> int:
 
     track = audio_track(meeting)
     if track is None:
-        print("У этой записи нет отдельной звуковой дорожки — облако писало только видео,\n"
-              "а расшифровка видео не принимает.\n"
-              "Лечится в настройках Zoom: Запись → Облачные записи → «Запись только звука».\n"
-              "Уже записанную встречу это не исправит, поможет только следующей.")
+        print(NO_AUDIO)
         return NOTHING
 
     target = target_dir(env, args.to) / file_name(meeting, track)
@@ -529,6 +766,9 @@ def main(argv=None) -> int:
         for item in (err.args[1] if len(err.args) > 1 else []):
             print("  · " + describe(item))
         return NOTHING
+    except NoRecording as err:            # ловится ПЕРВЫМ: это подвид отказа
+        print(err)
+        return NO_RECORDING
     except Refused as err:
         print(err)
         return REFUSED

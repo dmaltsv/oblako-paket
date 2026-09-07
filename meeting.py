@@ -11,6 +11,9 @@
 следующий шаг, а каждая команда сама пропускает свою работу, если её результат
 уже лежит. Прерванный разбор продолжается с того же места хоть завтра.
 
+    Встреча.json         карточка встречи с сервера (какая встреча, чей отдел,
+                         отчитался ли автомат, uuid записи) — шаг «встреча»,
+                         нужен команде «разбери встречу с <кем> <когда>»
     Транскрипт.md        расшифровка со сшитыми именами  (шаг «расшифровка»)
     Deepgram raw.json    сырой ответ Deepgram — второй раз за то же аудио не платим
     tasks.json           снимок задач с боевого сервера  (шаг «выгрузка»)
@@ -38,9 +41,29 @@
 чтобы `status` знал, чем кончилась прошлая отправка, не ходя в сеть. Пакет
 изменился — расписка перестаёт его прикрывать, и отправка идёт заново.
 
+СНАЧАЛА БИБЛИОТЕКА, ПОТОМ DEEPGRAM (волна 2, #459). Планёрку отдела к утру уже
+расшифровал автомат организатора и положил текст в Библиотеку — платить Deepgram
+второй раз за тот же час незачем. Поэтому `status` ищет готовый текст и в КЛОНЕ
+Библиотеки: правило пути там одно и держит его `library.py`
+(`Транскрипты/<ГГГГ-ММ-ДД> <название>.md`; у отделов — внутри `Отделы/<Отдел>/`).
+Найденный текст — сделанный шаг «расшифровка», и `transcribe` его не заказывает.
+Обновить клон (`library.py pull`) — дело агента: этот скрипт в сеть за
+Библиотекой не ходит, иначе «где мы?» зависало бы в поезде. КАКОЙ ИЗ ТЕКСТОВ ДНЯ
+ПРО ЭТУ ВСТРЕЧУ, РЕШАЕТ КАРТОЧКА (`Встреча.json`, команда `meetings --pick`), а
+не скрипт, — и решает всегда, даже когда текст за день один: Библиотека общая на
+всю компанию, и единственная расшифровка «за сегодня» бывает планёркой другого
+отдела. Взятый наугад чужой текст дошёл бы до разбора неотличимым от нужного.
+
+СВОЙ ТРАНСКРИПТ УЕЗЖАЕТ В БИБЛИОТЕКУ ПОСЛЕДНИМ ШАГОМ (решение Р3): текст
+планёрки отдела и совета, расшифрованный на этом ПК, после отправки пакета
+кладётся `library.py put --kind transcript`. `status` видит, лежит ли он там уже
+(тот же файл байт в байт), и пока нет — называет этот шаг. Встречи 1:1 и разовые
+— по решению организатора (Р16), для них шаг не обязателен.
+
 Команды (`--date` по умолчанию сегодня, формат ДД.ММ.ГГ — как имя папки разбора):
 
     python meeting.py status  --date 09.08.26 [--json]
+    python meeting.py meetings --date 09.08.26 [--to 10.08.26] [--json] [--pick НОМЕР]
     python meeting.py find    --date 09.08.26
     python meeting.py transcribe --date 09.08.26 [--audio Ф] [--names Ф] [--speaker N=Имя]
     python meeting.py tasks   --date 09.08.26 [--team Т] [--force]
@@ -64,7 +87,9 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import avtomat
 import fetch_tasks
+import library
 import oblako_client as client
 import send_package
 import transcribe
@@ -73,6 +98,7 @@ import zoom_deepgram_merge
 SCRIPT = Path(__file__).resolve()
 
 # --- имена файлов состояния -------------------------------------------------
+MEETING = "Встреча.json"            # карточка встречи с сервера (meetings --pick)
 TRANSCRIPT = "Транскрипт.md"
 TASKS = "tasks.json"
 DRAFT = "package.draft.json"
@@ -97,6 +123,12 @@ DEFAULT_AUDIO_DIRS = ("~/Documents/Zoom", "~/Zoom", "~/Downloads", "~/Загру
 # «любой .txt»: в той же папке лежит `chat.txt`, и разбор по чату вышел бы без
 # единого имени говорящего — молча и правдоподобно.
 NAME_SOURCES = ("*.vtt", "transcript.txt", "closed_caption.txt")
+
+# Виды, по имени которых видно, ЧЬИ это имена: `GMT…_Recording.vtt` называет
+# запись, к которой он положен. В общей папке записей такой файл берётся только
+# у своей записи (`find_names`); остальные два вида — постоянные имена внутри
+# папки локальной записи Zoom, и различать ими нечего.
+NAME_BY_MEETING = ("*.vtt",)
 
 # Слово человека судит `oblako_client.confirmed_by` — тот же судья, что у записи
 # в Библиотеку (`library.py put`). Копии правила здесь нет намеренно: разойдясь,
@@ -256,11 +288,198 @@ def find_names(review: Path, audio: Path | None) -> Path | None:
     # Ловить имена «любым файлом рядом» нельзя: в папке разбора лежат
     # `tasks.json`, `Deepgram raw.json` и сам пакет, а у локальной записи —
     # `chat.txt`. Поэтому список видов закрытый.
-    for folder in filter(None, (review, audio.parent if audio else None)):
+    #
+    # ТЁЗКА ЗАПИСИ — ПЕРВЫЙ, А В ПАПКЕ ЗАПИСЕЙ — ЕДИНСТВЕННЫЙ ГОДНЫЙ.
+    # `zoom_pull.py --meeting` (#450) кладёт транскрипт Zoom под именем звука
+    # («GMT…_Recording.vtt» рядом с «…_Recording.m4a») в ОБЩУЮ папку записей, где
+    # копятся и прошлые планёрки со своими `.vtt`. «Первый по алфавиту» там —
+    # транскрипт самой старой встречи, и её имена пришивались бы к сегодняшнему
+    # разговору МОЛЧА: склейка сдвиг подбирает всегда и о чужом тексте не знает,
+    # а разбор потом ставит задачи не тем людям. Свежая запись без своего `.vtt`
+    # — случай штатный (Zoom дописывает транскрипт ПОЗЖЕ звука), и «Спикер N»
+    # здесь честнее чужих имён.
+    #
+    # СВОЙ — И ТОТ, ЧЬЁ ИМЯ НАЧИНАЕТСЯ С ИМЕНИ ЗВУКА, а не только точный тёзка.
+    # Скачанный из кабинета Zoom транскрипт зовётся «GMT…_Recording.transcript.
+    # vtt» при звуке «GMT…_Recording.m4a»: стволы имён РАЗНЫЕ, хотя это свой
+    # текст своей записи. Пока годился один точный тёзка, такие имена молча
+    # терялись, расшифровка выходила «Спикер 1…8», и восстановление стоило
+    # получаса ручной работы. Чужая планёрка под это не подходит: её имя
+    # начинается со своего времени, а не со времени этой записи.
+    #
+    # `transcript.txt` и `closed_caption.txt` под правило имени не попадают: их
+    # кладёт локальная запись Zoom в СВОЮ папку встречи, где чужому взяться
+    # неоткуда, а имя у них одно на любую запись — тёзкой звука им не стать.
+    stem = audio.stem if audio else None
+
+    def _mine(item: Path) -> bool:
+        return bool(stem) and (item.stem == stem or item.stem.startswith(stem))
+
+    for folder, mine_only in ((review, False), (audio.parent if audio else None, True)):
+        if folder is None:
+            continue
         for pattern in NAME_SOURCES:
-            for item in sorted(folder.glob(pattern)):
+            for item in sorted(folder.glob(pattern),
+                               key=lambda item: (item.stem != stem, not _mine(item), item.name)):
+                if mine_only and pattern in NAME_BY_MEETING and not _mine(item):
+                    break          # своего нет (он был бы первым) — чужой не годится
                 return item
     return None
+
+
+# ---------------------------------------------------------------------------
+# Карточка встречи и готовый текст в Библиотеке
+# ---------------------------------------------------------------------------
+def meeting_card(review: Path) -> dict | None:
+    """Карточка встречи из `Встреча.json` — то, что сервер отдал `meetings --pick`.
+
+    Короткая выжимка, а не весь ответ: разбору нужны название (по нему ищется
+    транскрипт в Библиотеке), отдел (для `--team`), отчитался ли автомат, uuid
+    записи в облаке Zoom и АДРЕС ГОТОВОГО ТЕКСТА, если автомат уже отчитался.
+    Файла нет — разбор идёт как прежде, по одной дате.
+
+    Адрес (`report_repo`/`report_path`) кладёт сервер из отчёта автомата. Его
+    может не быть вовсе — у задания, которое ещё не отчиталось, и у сервера
+    старее этой правки; тогда транскрипт ищется прежним путём, по названию
+    встречи. Отступление обязательно: пакет и сервер обновляются порознь.
+    """
+    one = read_json(review / MEETING)
+    if not isinstance(one, dict) or not one.get("title"):
+        return None
+    job = one.get("job") if isinstance(one.get("job"), dict) else {}
+    return {
+        "id": one.get("id"),
+        "title": str(one.get("title")),
+        "date": one.get("date"),
+        "start_time": one.get("start_time"),
+        "organizer": (one.get("organizer") or {}).get("name"),
+        "team": (one.get("team") or {}).get("name"),
+        "automaton": job.get("status"),
+        "zoom_uuid": job.get("zoom_uuid"),
+        "report_repo": job.get("report_repo"),
+        "report_path": job.get("report_path"),
+    }
+
+
+def reported_transcript(found: list, card: dict | None) -> Path | None:
+    """Текст по адресу, НАЗВАННОМУ СЕРВЕРОМ, — точнее любой догадки по имени.
+
+    Автомат отчитывается репозиторием и путём внутри клона, и сервер держит их у
+    задания. Пока разбор их не спрашивал, адрес приходилось вычислять заново из
+    НЫНЕШНЕГО названия встречи (`library_transcripts`) — а подписан файл был
+    названием НА МОМЕНТ расшифровки. Встречу переименовали — имена расходятся,
+    готовый текст перестаёт находиться, и Deepgram платится второй раз за тот же
+    час. Адрес от сервера этого не знает: он не догадка, а факт.
+
+    Ключей нет или они пусты (задание не отчитывалось, сервер старее этой
+    правки) — `None`, и вызывающий идёт прежним путём. Путь за пределы клона
+    («..», абсолютный) отвергается: он приходит по сети, и проверить его дешевле
+    один раз здесь, чем объяснять потом, откуда взялся чужой файл.
+    """
+    where = str((card or {}).get("report_path") or "").strip().replace("\\", "/")
+    if not where:
+        return None
+    parts = [part for part in where.split("/") if part]
+    if not parts or ".." in parts or where.startswith("/") or ":" in parts[0]:
+        return None
+    name = str((card or {}).get("report_repo") or "").strip().lower()
+    for repo in found:
+        if not repo.cloned or (name and repo.name.lower() != name):
+            continue
+        item = repo.path.joinpath(*parts)
+        if item.is_file():
+            return item
+    return None
+
+
+def library_transcripts(when: date, env: dict, card: dict | None) -> tuple:
+    """(готовый текст, все транскрипты этого дня) в клонах Библиотеки.
+
+    ПРАВИЛО ПУТИ БЕРЁТСЯ У `library.py`, а не повторяется здесь: имя файла
+    складывается из его же шаблона вида `transcript`, папка отдела — из его же
+    `TEAMS_DIR`. Разойдись две копии правила — автомат клал бы текст туда, где
+    разбор его не ищет, и Deepgram оплачивался бы дважды молча.
+
+    ВЫБОР — ПО НАЗВАНИЮ ВСТРЕЧИ, А НЕ ПО РАЗМЕРУ, АЛФАВИТУ ИЛИ ЧИСЛУ ФАЙЛОВ.
+    Название приезжает в карточке (`Встреча.json`) и чистится так же, как его
+    чистит автомат перед записью (`avtomat.title_of`) — иначе «Планёрка (Розница
+    / север)» не нашла бы саму себя.
+
+    КАРТОЧКИ НЕТ — ГОТОВОГО ТЕКСТА НЕТ, даже когда транскрипт за день ровно один.
+    Библиотека общая на всю компанию: единственный текст этого дня — это скорее
+    планёрка ДРУГОГО отдела, положенная чужим автоматом. Пока «один за день»
+    считался своим, разбор шёл по чужому разговору целиком: Deepgram молчал,
+    `status` говорил «расшифровка есть», агент читал чужой текст — и задачи
+    уезжали людям со встречи, на которой их не было. Один файл или десять,
+    вопрос «этот ли текст про эту встречу» решает карточка; другого ответа у
+    скрипта нет и быть не может.
+
+    ПЕРВЫМ СПРАШИВАЕТСЯ АДРЕС ОТ СЕРВЕРА (`reported_transcript`), и только если
+    его нет — имя складывается по названию встречи. Порядок именно такой:
+    название встречи меняют кнопкой на экране, а файл в Библиотеке остаётся под
+    старым именем, и вычисленное имя перестаёт совпадать с ним навсегда.
+
+    Второй список (`seen`) — ВСЕ транскрипты дня, а не только подходящие: по
+    нему `state` сверяет байты своего текста с тем, что уже лежит в Библиотеке,
+    и обрезать его до кандидатов на выбор нельзя. Из чего выбирает человек,
+    решает `library_choice`.
+
+    Сети здесь нет: клон обновляет агент (`library.py pull`). Библиотека не
+    настроена или клонов нет — пустой ответ, а не отказ: пакет без Библиотеки
+    разбирает планёрки ровно как прежде.
+    """
+    try:
+        found = library.repos(env)
+    except client.Usage:
+        return None, []
+    inside = library.KINDS["transcript"]["path"]
+    day = when.strftime(library.ISO_DATE)
+    seen: list = []
+    for repo in found:
+        if not repo.cloned:
+            continue
+        pattern = inside.format(date=day, title="*")
+        if not repo.root_level:
+            pattern = f"{library.TEAMS_DIR}/*/{pattern}"
+        seen.extend(item for item in sorted(repo.path.glob(pattern)) if item.is_file())
+    reported = reported_transcript(found, card)
+    if reported is not None:
+        return reported, seen
+    if not seen or not card:
+        return None, seen
+    wanted = inside.format(date=day, title=avtomat.title_of(card)).split("/")[-1]
+    exact = [item for item in seen if item.name == wanted]
+    return (exact[0] if exact else None), seen
+
+
+def library_choice(seen: list, card: dict | None) -> list:
+    """Из чего выбирает ЧЕЛОВЕК: чужие тексты дня — выбор только без карточки.
+
+    Карточка есть, а файла под названием этой встречи среди них нет — значит все
+    они про ДРУГИЕ встречи, и выбирать не из чего: разбор идёт к записи и к
+    расшифровке. Пока эти файлы считались кандидатами, шаг `choose` вставал
+    поперёк дороги — «в Библиотеке несколько транскриптов» при одном чужом, — и
+    ветки «забрать запись» и «расшифровать» становились недостижимы вовсе:
+    выйти можно было только `transcribe --force`, который инструкция разрешает
+    лишь по слову человека «текст автомата не годится».
+    """
+    return [] if card else list(seen)
+
+
+def same_bytes(one: Path, others: list) -> bool:
+    """Лежит ли ЭТОТ файл среди других байт в байт — так `status` узнаёт, что
+    свой транскрипт уже в Библиотеке, не запоминая этого нигде."""
+    if not one.is_file():
+        return False
+    mine = digest(one)
+    return any(item.is_file() and digest(item) == mine for item in others)
+
+
+def package_kind(review: Path) -> str | None:
+    """Вид встречи из пакета (или черновика): «планёрка» или «1:1»."""
+    body = read_json(review / PACKAGE) or read_json(review / DRAFT) or {}
+    meeting = body.get("meeting") if isinstance(body, dict) else None
+    return (meeting or {}).get("kind") if isinstance(meeting, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -337,8 +556,14 @@ def state(review: Path, env: dict, when: date) -> dict:
     package = review / PACKAGE
     receipt = read_json(review / RECEIPT)
     snapshot = read_json(review / TASKS)
+    card = meeting_card(review)
+    own = review / TRANSCRIPT
+    # Готовый текст — свой или из Библиотеки. Свой сильнее: агент мог
+    # расшифровать заново (`--force`) поверх плохого текста автомата.
+    ready, in_library = library_transcripts(when, env, card)
+    transcript = own if own.is_file() else ready
     audio, searched = (None, [])
-    if not (review / TRANSCRIPT).is_file():
+    if transcript is None:
         audio, searched = find_audio(review, when, env)
 
     applied = bool(receipt) and receipt.get("exit_code") in (client.EXIT_OK,
@@ -350,9 +575,34 @@ def state(review: Path, env: dict, when: date) -> dict:
     return {
         "folder": str(review),
         "date": when.strftime(DATE_FMT),
+        "meeting": card,
         "audio": str(audio) if audio else None,
         "searched": [str(item) for item in searched],
-        "transcript": (review / TRANSCRIPT).is_file(),
+        "transcript": transcript is not None,
+        "transcript_file": str(transcript) if transcript else None,
+        "transcript_here": own.is_file(),
+        "library": bool(client.library_urls(env)),
+        "library_transcript": str(ready) if ready else None,
+        "library_candidates": [str(item) for item in library_choice(in_library, card)],
+        # ВСЕ транскрипты дня, а не только те, из чего выбирают. `candidates` —
+        # судья ШАГА, и с карточкой он пуст по построению; пока другого ключа не
+        # было, файлы дня при названной встрече не показывались НИГДЕ. А именно
+        # там и живёт беда переименования: текст этой самой встречи лежит под
+        # прежним названием, разбор его не узнаёт и платит Deepgram второй раз.
+        # Видит их теперь и человек, и агент — до того, как деньги уйдут.
+        "library_seen": [str(item) for item in in_library],
+        # Свой текст уже в Библиотеке — ТОЛЬКО тот же файл байт в байт. Помнить
+        # об этом негде и незачем: клон и есть ответ.
+        #
+        # Совпадения имени НЕ ХВАТАЕТ, и это не придирка. `transcribe --force`
+        # значит «текст автомата не годится»: файл под названием встречи в
+        # Библиотеке уже лежит — плохой, — а свой, исправленный, туда ещё не
+        # положен. Пока имя считалось за ответ, шаг Р3 не появлялся никогда, и
+        # забракованный текст оставался в Библиотеке насовсем: его читают
+        # подготовка, повестка и следующий разбор той же встречи.
+        "transcript_in_library": bool(ready) if not own.is_file()
+        else same_bytes(own, in_library),
+        "kind": package_kind(review),
         "tasks": tasks_fresh(snapshot),
         "tasks_stale": snapshot is not None and not tasks_fresh(snapshot),
         "draft": (review / DRAFT).is_file(),
@@ -369,28 +619,62 @@ def state(review: Path, env: dict, when: date) -> dict:
 
 def next_step(st: dict) -> tuple:
     """(ключ шага, что сделать словами). Порядок шагов задан ЗДЕСЬ и больше нигде."""
+    card = st.get("meeting") or {}
+    if not st["transcript"] and st["library_candidates"]:
+        # В Библиотеке за этот день лежит чужой текст (или несколько), а встреча
+        # не названа. Годится ли он — решает карточка, и только она: Библиотека
+        # общая, и текст «за сегодня» бывает планёркой другого отдела.
+        return "choose", (f"В Библиотеке за этот день лежат расшифровки "
+                          f"({len(st['library_candidates'])}): "
+                          + "; ".join(st["library_candidates"])
+                          + ". Про эту ли они встречу, скрипт не решает — назови встречу: "
+                          f"meeting.py meetings --date {st['date']} покажет встречи дня, "
+                          "meeting.py meetings --pick <номер встречи> запишет карточку. "
+                          "После неё спроси status снова: текст найдётся по названию "
+                          "встречи, а не найдётся — разбор пойдёт к записи и расшифровке. "
+                          "Этой встречи в Oblako нет вовсе (разовый созвон) — тогда "
+                          "расшифровывай запись сам: meeting.py transcribe --force")
     if not st["transcript"] and not st["audio"]:
-        return "recording", ("Записи нет. Возьми её из облака Zoom (коннектор) или положи "
-                             "файл в папку разбора — и запусти find.")
+        hint = ("Ни готового текста в Библиотеке, ни записи. Сначала обнови Библиотеку "
+                "(library.py pull) и спроси status снова")
+        if card.get("automaton") == "reported":
+            hint += " — автомат этой встречи отчитался «готово», текст должен быть там"
+        hint += ". Текста нет — возьми запись: из облака Zoom "
+        hint += (f"(zoom_pull.py --meeting {card['zoom_uuid']}) " if card.get("zoom_uuid")
+                 else "(zoom_pull.py --date <ДД.ММ.ГГ>) ")
+        hint += "или положи файл в папку разбора — и запусти find."
+        return "recording", hint
     if not st["transcript"]:
         return "transcribe", "Расшифровать запись: meeting.py transcribe"
     if not st["tasks"]:
         return "tasks", "Свежая выгрузка с боевого сервера: meeting.py tasks"
     if not st["draft"] and not st["package"]:
-        return "extract", ("Извлечь задачи из расшифровки и записать разбор в "
-                           f"{DRAFT}. Это работа агента, скриптом её не сделать.")
+        return "extract", (f"Извлечь задачи из расшифровки ({st['transcript_file']}) и "
+                           f"записать разбор в {DRAFT}. Это работа агента, скриптом её "
+                           "не сделать.")
     if not st["package"]:
         return "confirm", ('Показать превью (meeting.py preview) и ждать слова человека. '
                            'Сказал «запиши» — meeting.py confirm --word "<его слова>"')
     if not st["sent"]:
         return "send", "Отправить пакет на сервер: meeting.py send --team <отдел>"
-    if st["publish_off"]:
-        return "done", ("Разбор закончен: задачи применены, публиковать итог было "
-                        "некуда — у отдела нет группового чата. Делать нечего.")
-    if not st["published"]:
+    if not st["publish_off"] and not st["published"]:
         return "publish", ("Итог в группе неполон — досдать: "
                            "meeting.py publish --team <отдел>")
-    return "done", "Разбор доведён до публикации. Делать нечего."
+    finished = ("Разбор закончен: задачи применены, публиковать итог было некуда — у "
+                "отдела нет группового чата." if st["publish_off"]
+                else "Разбор доведён до публикации.")
+    # Транскрипт, сделанный здесь, — в Библиотеку (Р3). Планёрка отдела и совет
+    # — всегда, это шаг разбора; 1:1 и разовая — по решению организатора (Р16),
+    # и разбор без этого закончен. Взятый ИЗ Библиотеки текст класть некуда.
+    if st["library"] and st["transcript_here"] and not st["transcript_in_library"]:
+        put = ('library.py put --repo <имя> --kind transcript --date <ГГГГ-ММ-ДД> '
+               '--title "<название встречи>" [--team "<Отдел>"] --word "<слово человека>" '
+               f'--file "{st["transcript_file"]}", затем library.py push')
+        if st["kind"] == "планёрка":
+            return "library", f"{finished} Осталось положить транскрипт в Библиотеку: {put}"
+        return "done", (f"{finished} Транскрипт в Библиотеку — по решению организатора: "
+                        f"спроси его; скажет «запиши» — {put}. Иначе делать нечего.")
+    return "done", f"{finished} Делать нечего."
 
 
 # ---------------------------------------------------------------------------
@@ -408,9 +692,16 @@ def cmd_status(args, env: dict) -> int:
 
     done = {True: "✔", False: "·"}
     print(f"Разбор {st['date']} · {st['folder']}")
+    card = st["meeting"]
+    if card:
+        print(f"  ✔ встреча       #{card['id']} «{card['title']}» {card['start_time'] or ''} · "
+              f"{card['team'] or 'совет / без отдела'} · автомат: {card['automaton'] or 'не было'}")
     print(f"  {done[bool(st['audio'] or st['transcript'])]} запись        "
           f"{st['audio'] or ('уже расшифрована' if st['transcript'] else 'не найдена')}")
-    print(f"  {done[st['transcript']]} расшифровка   {TRANSCRIPT}")
+    if st["transcript_here"] or not st["transcript"]:
+        print(f"  {done[st['transcript']]} расшифровка   {TRANSCRIPT}")
+    else:
+        print(f"  ✔ расшифровка   в Библиотеке: {st['transcript_file']}")
     print(f"  {done[st['tasks']]} выгрузка      "
           f"{'снимок не сегодняшний — нужен свежий' if st['tasks_stale'] else TASKS}")
     print(f"  {done[st['draft'] or st['package']]} разбор        "
@@ -419,7 +710,72 @@ def cmd_status(args, env: dict) -> int:
     print(f"  {done[st['sent']]} отправлено")
     print(f"  {'—' if st['publish_off'] else done[st['published']]} итог в группе"
           f"{'  публиковать некуда — так и сдавали' if st['publish_off'] else ''}")
+    if st["library"] and st["transcript_here"]:
+        print(f"  {done[st['transcript_in_library']]} транскрипт в Библиотеке"
+              f"{'' if st['transcript_in_library'] else '  свой, ещё не положен'}")
     print(f"\nДальше: {what}")
+    return client.EXIT_OK
+
+
+def cmd_meetings(args, env: dict) -> int:
+    """Встречи дня (или окна) с сервера — и карточка выбранной в папку разбора.
+
+    Нужна команде «разбери встречу с <кем> <когда>»: встречу находит не память
+    агента и не догадка по названию папки, а сервер — по ключу, и только те, что
+    человек вправе видеть. Ходит через `oblako_client.meetings`, как автомат:
+    второй дороги к серверу у пакета нет. Формат и версия сверяются ДО показа.
+
+    `--pick` кладёт карточку выбранной встречи в `Встреча.json`: по ней `status`
+    находит транскрипт в Библиотеке по названию, а подсказка «записи нет» знает
+    uuid облачной записи. Выбирает агент вместе с человеком, а не скрипт: у
+    сервера нет участников в карточке, и «встреча с Дашей» узнаётся по названию
+    и организатору.
+    """
+    since = meeting_date(getattr(args, "date", None))
+    until = meeting_date(args.to) if args.to else since
+    if until < since:
+        raise client.Usage(f"Окно перевёрнуто: --to {args.to} раньше --date {since.strftime(DATE_FMT)}")
+    url, key = client.base_url(env), client.access_key(env)
+    if args.pick:
+        answer = client.meeting(args.pick, url=url, key=key)
+        client.check_meetings(answer)
+        one = answer.get("meeting") or {}
+        # Папка — по ДАТЕ ВСТРЕЧИ из карточки, а не по `--date` запроса: окно
+        # могло быть за неделю, а разбор живёт в папке своего дня.
+        review = folder_for(args)
+        if not getattr(args, "folder", None) and one.get("date"):
+            try:
+                day = datetime.strptime(str(one["date"]), library.ISO_DATE).date()
+                review = repo_root() / REVIEWS_DIR / day.strftime(DATE_FMT)
+            except ValueError:
+                pass
+        review.mkdir(parents=True, exist_ok=True)
+        (review / MEETING).write_text(json.dumps(one, ensure_ascii=False, indent=2),
+                                      encoding="utf-8")
+        print(f"Встреча #{one.get('id')} «{one.get('title')}» {one.get('date')} "
+              f"{one.get('start_time') or ''} — карточка записана: {review / MEETING}")
+        print("Дальше: library.py pull, затем meeting.py status")
+        return client.EXIT_OK
+    answer = client.meetings(url=url, key=key, date_from=since.strftime(library.ISO_DATE),
+                             date_to=until.strftime(library.ISO_DATE))
+    client.check_meetings(answer)
+    found = answer.get("meetings") or []
+    if args.json:
+        print(json.dumps(found, ensure_ascii=False, indent=2))
+        return client.EXIT_OK
+    window = since.strftime(DATE_FMT) + (f" — {until.strftime(DATE_FMT)}" if until != since else "")
+    print(f"Встречи {window} (видит {answer.get('actor', {}).get('name', '?')}):")
+    if not found:
+        print("  ни одной — в Oblako за это окно встреч нет")
+    for one in found:
+        job = one.get("job") or {}
+        print(f"  #{one.get('id')}  {one.get('date')} {one.get('start_time') or '--:--'}  "
+              f"«{one.get('title')}»  организатор: {(one.get('organizer') or {}).get('name', '?')}"
+              f"  отдел: {(one.get('team') or {}).get('name') or '—'}"
+              f"  автомат: {job.get('status') or 'не было'}"
+              f"{'  запись Zoom: ' + job['zoom_uuid'] if job.get('zoom_uuid') else ''}"
+              f"{'  ОТМЕНЕНА' if one.get('status') == 'cancelled' else ''}")
+    print("Дальше: meeting.py meetings --pick <номер> — карточка нужной встречи в папку разбора")
     return client.EXIT_OK
 
 
@@ -466,6 +822,45 @@ def cmd_transcribe(args, env: dict) -> int:
     if out.is_file() and not args.force:
         print(f"[Пропуск] расшифровка уже есть: {out}")
         return client.EXIT_OK
+    # Готовый текст в Библиотеке — тот же сделанный шаг: Deepgram за него не
+    # платим. `--force` — осознанное «расшифруй заново, не глядя на Библиотеку».
+    if not args.force and not args.out:
+        card = meeting_card(review)
+        ready, seen = library_transcripts(when, env, card)
+        if ready is not None:
+            print(f"[Пропуск] расшифровка уже в Библиотеке: {ready}")
+            print("  читай её — Deepgram не нужен; заново с записи — только с --force")
+            return client.EXIT_OK
+        # Отказ — только когда выбирать И ПРАВДА НЕ ИЗ ЧЕГО: встреча не названа.
+        # С карточкой чужие тексты дня не мешают — они про другие встречи, и
+        # расшифровка этой идёт своим ходом, без `--force`.
+        # Карточка есть, а текста под её названием нет — расшифровка пойдёт, и
+        # это правильно: файлы дня обычно про ДРУГИЕ встречи. Но молчать нельзя:
+        # тот же вид у переименованной встречи, чей текст уже оплачен и лежит
+        # рядом под прежним именем. Отказом здесь ответить нельзя (он запер бы
+        # штатный путь), а показать — обязаны.
+        if seen and card and not library_choice(seen, card):
+            print(f"[Внимание] в Библиотеке за {when.strftime(DATE_FMT)} уже лежат "
+                  f"расшифровки, но ни одна не названа как эта встреча "
+                  f"(«{avtomat.title_of(card)}»):")
+            for item in seen:
+                print(f"  · {item}")
+            print("  Так бывает, когда встречу переименовали после расшифровки. Если нужный "
+                  "текст среди них — останови расшифровку (Deepgram платный) и положи файл "
+                  f"в {review / TRANSCRIPT}.")
+        if library_choice(seen, card):
+            raise client.Usage(
+                f"В Библиотеке за {when.strftime(DATE_FMT)} лежат расшифровки, а про эту "
+                "ли они встречу — скрипт не решает",
+                [str(item) for item in seen] +
+                ["назови встречу: meeting.py meetings --pick <номер> — и повтори",
+                 # Второй выход называется ТЕМ ЖЕ СЛОВОМ, что и в подсказке шага
+                 # `choose`: без карточки повтор этой же команды даёт тот же
+                 # отказ, и «она расшифрует сама» здесь буквально неверно. Кому
+                 # выход нужен — разовому созвону, которого в Oblako нет вовсе:
+                 # карточку ему взять неоткуда, `meetings --pick` не поможет.
+                 "нужной среди них нет (разового созвона в Oblako нет вовсе) — "
+                 "расшифруй запись сам: meeting.py transcribe --force"])
 
     if args.audio:
         audio = Path(args.audio).expanduser()
@@ -762,9 +1157,9 @@ def cmd_publish(args, env: dict) -> int:
 
 
 COMMANDS = {
-    "status": cmd_status, "find": cmd_find, "transcribe": cmd_transcribe,
-    "tasks": cmd_tasks, "preview": cmd_preview, "confirm": cmd_confirm,
-    "send": cmd_send, "publish": cmd_publish,
+    "status": cmd_status, "meetings": cmd_meetings, "find": cmd_find,
+    "transcribe": cmd_transcribe, "tasks": cmd_tasks, "preview": cmd_preview,
+    "confirm": cmd_confirm, "send": cmd_send, "publish": cmd_publish,
 }
 
 
@@ -780,6 +1175,12 @@ def _parser() -> argparse.ArgumentParser:
 
     status = common("status", "где мы и что дальше")
     status.add_argument("--json", action="store_true", help="машинный вид для агента")
+
+    meetings = common("meetings", "встречи дня с сервера; --pick кладёт карточку выбранной")
+    meetings.add_argument("--to", help="конец окна ДД.ММ.ГГ (без него — один день --date)")
+    meetings.add_argument("--pick", type=int, metavar="НОМЕР",
+                          help=f"записать карточку этой встречи в {MEETING} папки разбора")
+    meetings.add_argument("--json", action="store_true", help="машинный вид для агента")
 
     common("find", "какая запись и какой источник имён нашлись")
 

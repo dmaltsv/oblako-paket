@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import ssl
 import subprocess
@@ -84,6 +85,7 @@ ACTOR_ENV = "OBLAKO_ACTOR_ID"           # только локальный реж
 LIBRARY_URLS_ENV = "OBLAKO_LIBRARY_URLS"    # адреса репозиториев Библиотеки через `;`
 LIBRARY_DIR_ENV = "OBLAKO_LIBRARY_DIR"      # где держать клоны, если не рядом с командами
 LIBRARY_DIR = "Библиотека"                  # умолчание: папка клонов в корне работы
+ROUTINE_ENV = "OBLAKO_ROUTINE_ID"           # идентификатор рутины-автомата (адрес, не секрет)
 
 # Таймауты заданы ЯВНО и разные: у выгрузки это чистое чтение, а сдача разбора
 # на той стороне ещё рассылает уведомления и публикует пост в группу. Общий
@@ -108,6 +110,27 @@ MAX_PACKAGE_BYTES = 512 * 1024
 # заметить расхождение и назвать отставшего.
 PACKAGE_FORMAT_VERSION = 2
 EXPORT_FORMAT = "oblako-tasks-export"
+
+# --- версия формата ручек автомата (#454) -----------------------------------
+# ПАРА СВОЯ, А НЕ ФОРМАТ ВЫГРУЗКИ ЗАДАЧ. У ручек автомата свой договор с
+# сервером, и версии у них обязаны жить врозь: одна пара на два формата
+# означала бы, что правка разбора планёрки двигает номер расшифровки и наоборот.
+# То же, что `MEETINGS_FORMAT` и `MEETINGS_VERSION` в `bot/core.py`; копия здесь
+# по той же причине, что и у разбора, — пакет обновляется отдельно от сервера.
+MEETINGS_FORMAT = "oblako-meetings"
+MEETINGS_VERSION = 1
+
+# --- отчёт автомата о расшифровке (#454) ------------------------------------
+# Потолок строки — копия серверного (`core.TRANSCRIPT_REPORT_LINE_MAX`), и
+# держится он ЗДЕСЬ, а не в `avtomat.py`. Причина сбоя приезжает из чужих
+# текстов (ответ Zoom, вывод git, трассировка Python), и без обрезки на сервер
+# уехала бы полем `error` сама расшифровка: инвариант 22 («сервер текстов встреч
+# не хранит») держится в том числе аккуратностью этого клиента.
+TRANSCRIPT_REPORT_LINE_MAX = 500
+TRANSCRIPT_DONE = "done"
+TRANSCRIPT_FAILED = "failed"
+TRANSCRIPT_NO_RECORDING = "no_recording"
+TRANSCRIPT_OUTCOMES = (TRANSCRIPT_DONE, TRANSCRIPT_FAILED, TRANSCRIPT_NO_RECORDING)
 
 # Имена файлов папки разбора, которые нужны ОБОИМ клиентам. Остальные знает одна
 # механика разбора (`meeting.py`); эти два вынесены сюда потому, что гейт
@@ -263,14 +286,28 @@ def find_dotenv(start: Path, stop: Optional[Path] = None) -> Optional[Path]:
 
 
 def settings(script: Path) -> dict:
-    """Значения `.env` для этого скрипта (пустой словарь, если файла нет).
+    """Настройки этого скрипта: `.env` рядом со скриптами, а ПОВЕРХ — окружение.
 
-    Потолок поиска — корень рабочей копии: в установочном пакете это папка самих
-    скриптов, в репозитории проекта — его корень, где `.env` и лежит.
+    Потолок поиска `.env` — корень рабочей копии: в установочном пакете это
+    папка самих скриптов, в репозитории проекта — его корень, где `.env` и лежит.
+
+    ОКРУЖЕНИЕ ВАЖНЕЕ ФАЙЛА, И ЭТО ОДНО ПРАВИЛО НА ВЕСЬ ПРОЕКТ — то же, что у
+    сервера (`bot.load_env`). Здесь оно не удобство, а условие работы автомата: в
+    облачной машине рутины `.env` НЕТ ВОВСЕ, и ключи Zoom, Deepgram, доступа к
+    серверу и адреса Библиотеки приезжают туда переменными окружения, которые
+    человек задал рутине один раз. Пока правило жило в одном скрипте
+    (`zoom_pull.load_env`), соседи латали себя поодиночке — параметром `env` у
+    `library.main`, флагом у `avtomat.run_script`, своим обходом в `transcribe`, —
+    и в пакете завелось три способа прочитать одно окружение. Способ один, и он
+    здесь: чтение настроек в пакете единственное.
     """
     here = Path(script).resolve().parent
     found = find_dotenv(here, stop=work_root(script))
-    return read_dotenv(found) if found is not None else {}
+    values = read_dotenv(found) if found is not None else {}
+    for name, value in os.environ.items():
+        if value:
+            values[name] = value
+    return values
 
 
 def access_key(env: dict) -> str:
@@ -296,14 +333,23 @@ def access_key(env: dict) -> str:
     return key
 
 
-def check_export(snapshot: dict) -> None:
-    """Снимок с сервера — того ли формата и той ли версии, что понимает пакет.
+def check_format(answer: dict, *, fmt: str, ours: int, what: str,
+                 tail_stale: str = "", tail_ahead: str = "") -> None:
+    """Ответ сервера — того ли формата и той ли версии, что понимает пакет.
 
-    СВЕРКА СТОИТ НА ВЫГРУЗКЕ, А НЕ НА СДАЧЕ. Выгрузка — первый шаг разбора;
-    узнать «пакет устарел» после часа работы над встречей значит узнать слишком
-    поздно, и весь разбор пришлось бы собирать заново. Второй рубеж всё равно
-    остаётся, и он же последний: версию пакета судит сервер при приёме (`core.
-    package_version_error`) — судья формата один, и это он.
+    ОДНО МЕСТО НА ВСЕ ДВЕРИ. Правило сверки одинаково у выгрузки задач и у ручек
+    автомата вплоть до тонкости с `bool`, и написанное дважды оно однажды
+    разъедется: поправят одну копию, а вторая продолжит считать `True` версией 1.
+
+    Расходятся у дверей только ХВОСТЫ СОВЕТА, и они здесь параметрами: разбор,
+    узнавший о расхождении на выгрузке, придётся собирать заново, а автомату
+    пересобирать нечего — общий текст врал бы одной из сторон.
+
+    СВЕРКА СТОИТ ДО РАБОТЫ, А НЕ ПОСЛЕ. Выгрузка — первый шаг разбора; узнать
+    «пакет устарел» после часа работы над встречей значит узнать слишком поздно.
+    У автомата цена прямее: за расшифровку платят Deepgram. Второй рубеж всё
+    равно остаётся, и он же последний: версию пакета судит сервер при приёме
+    (`core.package_version_error`) — судья формата один, и это он.
 
     Отставшего называем поимённо: меньше нашей — отстал сервер (обновляет его
     владелец), больше — отстал этот компьютер (обновляется командой агенту
@@ -312,28 +358,36 @@ def check_export(snapshot: dict) -> None:
     Код выхода — 1, а не 2 и не 3: сервер ответил и не отказывал, сеть исправна,
     повтор бессмыслен. Помогает ровно одно действие, и оно названо.
     """
-    if snapshot.get("format") != EXPORT_FORMAT:
+    if answer.get("format") != fmt:
         raise Usage(
-            f"Это не выгрузка Oblako: формат {snapshot.get('format')!r} вместо "
-            f"{EXPORT_FORMAT!r}. Проверь {URL_ENV} — адрес ведёт не на тот сервер."
+            f"Это не {what}: формат {answer.get('format')!r} вместо {fmt!r}. "
+            f"Проверь {URL_ENV} — адрес ведёт не на тот сервер."
         )
-    ours = PACKAGE_FORMAT_VERSION
-    theirs = snapshot.get("version")
-    if theirs == ours:
-        return
-    # `bool` — подкласс `int`: без явного отсева `True` прочиталось бы версией 1.
+    theirs = answer.get("version")
+    # `bool` — подкласс `int`, и отсев стоит ДО сравнения: `True == 1` — правда,
+    # поэтому у двери с версией 1 (ручки автомата) `True` проходил бы за свою
+    # версию молча. Версия — целое число и ничто другое.
     number = isinstance(theirs, int) and not isinstance(theirs, bool)
+    if number and theirs == ours:
+        return
     if number and theirs < ours:
         raise Usage(
             f"Сервер старее этого пакета (v{theirs} против v{ours}): отстал сервер, "
-            f"а не твой компьютер — скажи владельцу системы. Разбор пока не собрать."
+            f"а не этот компьютер — скажи владельцу системы.{tail_stale}"
         )
     seen = f"v{theirs}" if number else repr(theirs)
     raise Usage(
-        f"Сервер ушёл вперёд ({seen}, этот пакет говорит на v{ours}): сначала обнови "
-        f"пакет на своём компьютере — командой агенту «обнови пакет», — потом "
-        f"начинай разбор заново."
+        f"Сервер ушёл вперёд ({seen}, этот пакет говорит на v{ours}): обнови пакет на "
+        f"своём компьютере — командой агенту «обнови пакет».{tail_ahead}"
     )
+
+
+def check_export(snapshot: dict) -> None:
+    """Выгрузка задач — того ли формата и версии. Правило — `check_format`."""
+    check_format(snapshot, fmt=EXPORT_FORMAT, ours=PACKAGE_FORMAT_VERSION,
+                 what="выгрузка Oblako",
+                 tail_stale=" Разбор пока не собрать.",
+                 tail_ahead=" Потом начинай разбор заново.")
 
 
 def base_url(env: dict) -> str:
@@ -695,6 +749,72 @@ def _refusal(refusal: urllib.error.HTTPError) -> ClientError:
         details=details,
         status=refusal.code,
     )
+
+
+# ---------------------------------------------------------------------------
+# Ручки автомата: встречи и отчёт о расшифровке (#454, зовёт их `avtomat.py`)
+#
+# Живут ЗДЕСЬ, а не в самом автомате, по тому же правилу, что и остальные две
+# двери контура ПК: способ предъявить ключ, таймаут, проверка TLS и смысл кодов
+# возврата обязаны быть одни на все обращения к серверу. Второй дороги к нему у
+# пакета нет и не заводится.
+# ---------------------------------------------------------------------------
+def check_meetings(answer: dict) -> None:
+    """Ответ ручки автомата — того ли формата и версии. Правило — `check_format`.
+
+    Хвостов совета здесь нет: автомату, в отличие от разбора, пересобирать
+    нечего — он просто не начнёт работу и отчитается серверу.
+    """
+    check_format(answer, fmt=MEETINGS_FORMAT, ours=MEETINGS_VERSION,
+                 what="ответ Oblako про встречи")
+
+
+def meetings(*, url: str, key: str, date_from=None, date_to=None,
+             awaiting: bool = False) -> dict:
+    """Встречи, которые вправе видеть предъявитель ключа.
+
+    Окно называется ЦЕЛИКОМ или не называется вовсе — половину сервер отвергает;
+    `awaiting=True` спрашивает только встречи с живым заданием автомата (очередь
+    и полёт) и окна не требует: так вечерний добор узнаёт, что осталось.
+    """
+    query: dict = {}
+    if date_from:
+        query["from"] = date_from
+    if date_to:
+        query["to"] = date_to
+    if awaiting:
+        query["awaiting"] = "1"
+    return call("GET", "/api/pc/meetings", url=url, key=key,
+                timeout=TIMEOUT_READ_SEC, query=query or None)
+
+
+def meeting(meeting_id: int, *, url: str, key: str) -> dict:
+    """Подробности одной встречи. Чужая — отказ сервера, а не пустой ответ."""
+    return call("GET", f"/api/pc/meetings/{int(meeting_id)}", url=url, key=key,
+                timeout=TIMEOUT_READ_SEC)
+
+
+def transcripts(meeting_id: int, report: dict, *, url: str, key: str) -> dict:
+    """Отчёт автомата о расшифровке: «готово», «не вышло» или «записи нет».
+
+    ТЕЛО ЧИСТИТСЯ ЗДЕСЬ, а не у вызывающего: пустые поля выбрасываются (сервер
+    отвергает незнакомое и кривое поимённо, и `null` вместо числа минут стоил бы
+    всей работы), строки режутся потолком. Исход сверяется со списком — чужое
+    слово тут наша собственная опечатка, и стоит она отказа 400 после часа
+    работы автомата.
+    """
+    outcome = report.get("outcome")
+    if outcome not in TRANSCRIPT_OUTCOMES:
+        raise Usage(f"Исхода «{outcome}» у отчёта не бывает: "
+                    f"{', '.join(TRANSCRIPT_OUTCOMES)}")
+    body = {}
+    for name, value in report.items():
+        if value is None:
+            continue
+        body[name] = value[:TRANSCRIPT_REPORT_LINE_MAX] if isinstance(value, str) else value
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    return call("POST", f"/api/pc/transcripts/{int(meeting_id)}", url=url, key=key,
+                timeout=TIMEOUT_READ_SEC, body=raw)
 
 
 # ---------------------------------------------------------------------------

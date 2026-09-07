@@ -39,16 +39,14 @@ def pause():
 
 
 def load_api_key():
-    """DEEPGRAM_API_KEY: переменная окружения, затем ближайший `.env` вверх.
+    """DEEPGRAM_API_KEY общим чтением настроек пакета (`oblako_client.settings`).
 
-    `.env` читает `oblako_client`, а не свой разбор: у пакета один формат файла
-    на все скрипты, и второй парсер разошёлся бы с первым молча — на кавычках,
-    на BOM или на пробеле вокруг `=`.
+    Ни своего разбора `.env`, ни своего обхода окружения: и файл, и переменные
+    окружения (в облаке рутины файла нет вовсе) читает одно место на весь пакет.
+    Второй способ разошёлся бы с первым молча — на кавычках, на BOM или на
+    пробеле вокруг `=`.
     """
-    key = os.environ.get("DEEPGRAM_API_KEY")
-    if key:
-        return key.strip()
-    return oblako_client.settings(__file__).get("DEEPGRAM_API_KEY") or None
+    return (oblako_client.settings(__file__).get("DEEPGRAM_API_KEY") or "").strip() or None
 
 
 # --- Настройки распознавания (менять обычно не нужно) -----------------------
