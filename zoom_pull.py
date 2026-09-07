@@ -211,10 +211,12 @@ class HomeOnly(urllib.request.HTTPRedirectHandler):
 
     Ссылка на скачивание перебрасывает с `us06web.zoom.us` на `ssrweb.zoom.us`
     (проверено живым вызовом), и заголовок с токеном обязан ехать следом —
-    иначе файл не отдадут. Но `urllib`, в отличие от иных клиентов, заголовки
-    при смене хоста НЕ срезает: перенаправь Zoom однажды на чужой адрес — и
-    ключ уехал бы туда же. Ограда стоит не потому, что это случалось, а потому
-    что цена промаха — чужой доступ ко всем записям аккаунта.
+    иначе файл не отдадут. Но `redirect_request` из `urllib`, в отличие от
+    иных клиентов, заголовки при смене хоста НЕ срезает: перенаправь Zoom
+    однажды на чужой адрес — и ключ уехал бы туда же. Ограда стоит не потому,
+    что это случалось, а потому что цена промаха — чужой доступ ко всем
+    записям аккаунта. Перебросы ведёт `KeepAlive.open`, а не `urllib`
+    (см. там), но новый запрос строит по-прежнему эта родительская функция.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -225,9 +227,38 @@ class HomeOnly(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-# Своя дорога в сеть вместо общей: у `urllib.request.urlopen` обработчик
-# редиректов стандартный, и ограду выше он бы не заметил.
-OPENER = urllib.request.build_opener(HomeOnly)
+class KeepAlive:
+    """Дорога в Zoom: постоянное соединение и ограда редиректов.
+
+    Раньше здесь стоял `urllib.request.build_opener(HomeOnly)`. Он шлёт
+    `Connection: close` всегда, и на машине, где весь трафик идёт через
+    TUN-тоннель VPN-клиента (у руководителя — Happ), запись приходила без
+    последних ~50 КБ и оставалась `.part` — 07.09.2026 две закачки из четырёх
+    (#464). Причина, опыт и что помощник повторяет за `urlopen` — в пояснении
+    `oblako_client.keep_alive_request`. Перебросы Zoom (`us06web.zoom.us` →
+    `ssrweb.zoom.us`) помощник не следует, их ведёт этот класс — через ту же
+    ограду `HomeOnly`, что и раньше: чужой хост — отказ, ключ не уезжает.
+    Единственная точка, которую подменяют тесты автомата (`OPENER.open`).
+    """
+
+    LIMIT = 10          # перебросов подряд; Zoom делает один
+
+    def open(self, request: urllib.request.Request, timeout: int = TIMEOUT):
+        guard = HomeOnly()
+        for _ in range(self.LIMIT):
+            response = client.keep_alive_request(request, timeout)
+            where = response.getheader("Location") if 300 <= response.status < 400 else None
+            if where is None:
+                return response
+            newurl = urllib.parse.urljoin(request.full_url, where)
+            request = guard.redirect_request(request, response, response.status,
+                                             response.reason, response.headers, newurl)
+            response.read()         # тело переброса не нужно; соединение отпустить
+            response.close()
+        raise urllib.error.URLError(f"Zoom перебрасывает по кругу, больше {self.LIMIT} раз")
+
+
+OPENER = KeepAlive()
 
 
 # ---------------------------------------------------------------------------

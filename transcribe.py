@@ -3,8 +3,8 @@ import os
 import sys
 import glob
 import json
-import urllib.request
 import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import oblako_client                      # noqa: E402  — путь к соседям задан строкой выше
@@ -91,16 +91,18 @@ def load_proxy():
 def deepgram_urlopen(req, timeout):
     """Единственный выход в сеть к Deepgram — из этого файла и из склейки.
 
-    Задан `DEEPGRAM_PROXY` — идём через него; не задан — обычный `urlopen`,
-    то есть системные переменные окружения, как было.
+    Не `urllib.request.urlopen`, а `oblako_client.keep_alive_request`: ответ
+    Deepgram на планёрку — 3–6 МБ, и через `urlopen` (с его `Connection: close`)
+    он на машине с VPN-тоннелем приходил без хвоста и висел до таймаута
+    (07.09.2026, четыре планёрки подряд). Причина и опыт — в пояснении самого
+    помощника. Нарезка аудио на куски руководителем запрещена: куски прячут
+    дефект за маленькими ответами, а не лечат его.
+
+    Дорога та же, что была: `DEEPGRAM_PROXY` задан — через него; не задан —
+    системный прокси, как у `urlopen`; нет и его — напрямую. 4xx/5xx —
+    `urllib.error.HTTPError`, как и раньше у вызывающих.
     """
-    proxy = load_proxy()
-    if not proxy:
-        return urllib.request.urlopen(req, timeout=timeout)
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-    )
-    return opener.open(req, timeout=timeout)
+    return oblako_client.keep_alive_request(req, timeout, proxy=load_proxy())
 
 
 def deepgram_transcribe(file_path, api_key=None):

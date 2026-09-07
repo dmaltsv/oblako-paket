@@ -56,7 +56,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -639,6 +641,69 @@ def _tls_context() -> ssl.SSLContext:
     context.check_hostname = True
     context.verify_mode = ssl.CERT_REQUIRED
     return context
+
+
+def keep_alive_request(request: urllib.request.Request, timeout: int, proxy=None):
+    """Один HTTPS-запрос БЕЗ `Connection: close` — дорога для больших ответов.
+
+    `urllib.request.urlopen` шлёт `Connection: close` всегда (зашито в
+    `AbstractHTTPHandler.do_open`, снаружи не отключается), и сервер закрывает
+    соединение сразу за последним байтом ответа. VPN-клиент с TUN-адаптером,
+    через который идёт весь трафик машины (у руководителя — Happ,
+    `happ-default-tun` как маршрут по умолчанию; «напрямую» на такой машине не
+    бывает), на этом закрытии теряет хвост большого ответа. 07.09.2026 так
+    висели до таймаута четыре расшифровки подряд (ответ Deepgram 3–6 МБ без
+    последних десятков КБ) и рвались две закачки из четырёх у Zoom («последние
+    50 КБ», #464). Воспроизводится на чём угодно: 10 МБ с speed.cloudflare.com
+    с этим заголовком — 9 961 472 байта и тишина, без него — целиком за 5 с;
+    прокси ни при чём, теряется одинаково. Малые ответы (≤ 1 МБ) проходят и
+    так — поэтому ручки сервера Oblako ходят через `urlopen`, а сюда идут
+    Deepgram и скачивание записей.
+
+    Что повторяет за `urlopen`, чтобы серверы видели тот же запрос: `Content-Type`
+    формы у POST без своего типа, `Accept-Encoding: identity` (иначе JSON может
+    приехать сжатым), проверка TLS из `_tls_context`, таймаут на каждую
+    операцию с сокетом. Дорога: `proxy` задан — CONNECT-тоннель через него; не
+    задан — системный прокси, как у `urlopen` (переменные окружения, на Windows
+    ещё реестр; `no_proxy` уважается); нет и его — напрямую.
+
+    Возвращает `http.client.HTTPResponse` (`with`, `.read()`, `.status`). 4xx и
+    5xx поднимаются как `urllib.error.HTTPError`, как у `urlopen`; 3xx НЕ
+    следует — ответ отдаётся как есть, переброс решает вызывающий (у Zoom
+    своя ограда `HomeOnly`).
+    """
+    url = urllib.parse.urlsplit(request.full_url)
+    host, port = url.hostname, url.port or 443
+    if proxy is None and not urllib.request.proxy_bypass(host):
+        proxy = urllib.request.getproxies().get("https")
+    if proxy:
+        via = urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy)
+        conn = http.client.HTTPSConnection(via.hostname, via.port or 8080,
+                                           timeout=timeout, context=_tls_context())
+        tunnel_headers = {}
+        if via.username is not None:
+            pair = (urllib.parse.unquote(via.username) + ":"
+                    + urllib.parse.unquote(via.password or ""))
+            tunnel_headers["Proxy-Authorization"] = (
+                "Basic " + base64.b64encode(pair.encode("utf-8")).decode("ascii"))
+        conn.set_tunnel(host, port, tunnel_headers)
+    else:
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout,
+                                           context=_tls_context())
+    path = (url.path or "/") + ("?" + url.query if url.query else "")
+    headers = {name: value for name, value in request.header_items()
+               if name.lower() != "connection"}
+    lowered = {name.lower() for name in headers}
+    if request.data is not None and "content-type" not in lowered:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if "accept-encoding" not in lowered:
+        headers["Accept-Encoding"] = "identity"
+    conn.request(request.get_method(), path, body=request.data, headers=headers)
+    response = conn.getresponse()
+    if response.status >= 400:
+        raise urllib.error.HTTPError(request.full_url, response.status, response.reason,
+                                     response.headers, response)
+    return response
 
 
 def urlopen(request: urllib.request.Request, timeout: int):
