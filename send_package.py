@@ -224,9 +224,14 @@ def report_lines(body: dict) -> list:
     if body.get("already_applied"):
         return [f"Этот пакет уже применялся ({body.get('applied_at', 'когда — не записано')}) "
                 f"— задачи не тронуты."]
+    # Третья корзина (#467) названа отдельно: задача коллеге из другого отдела —
+    # то, что руководитель обязан увидеть в итоге сдачи, а не найти потом в
+    # чужом списке. У сервера, не знающего о ней, ключа нет — тогда и строки нет.
+    outside = counts.get("outside", 0)
     lines = [f"Пакет применён: {meeting.get('kind', 'встреча')} {meeting.get('date', '')} · "
              f"отдел «{team}»",
-             f"  себе: {counts.get('own', 0)} · другим: {counts.get('assigned', 0)}"]
+             f"  себе: {counts.get('own', 0)} · другим: {counts.get('assigned', 0)}"
+             + (f" · коллегам из других отделов: {outside}" if outside else "")]
     delivery = body.get("delivery")
     if delivery:
         lines.append(f"  уведомления: доставлено {delivery.get('sent', 0)}, "
