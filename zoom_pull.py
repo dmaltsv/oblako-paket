@@ -2,7 +2,7 @@
 """Забрать звуковую дорожку планёрки из облака Zoom в папку записей (#371).
 
 Часть установочного пакета, но НЕОБЯЗАТЕЛЬНАЯ: работает только у того, кто выдал
-своему ключу Zoom два права на чтение записей. Без них разбор идёт прежней
+своему ключу Zoom три права на чтение записей. Без них разбор идёт прежней
 дорогой — агент спрашивает коннектор Zoom и даёт человеку ссылку на файл.
 Скрипт ходит в облако ЛИЧНОГО Zoom-аккаунта того, кто записывает планёрку;
 кода сервера в нём нет, как и во всём пакете.
@@ -10,7 +10,7 @@
     python zoom_pull.py --list --date 11.08.26   что есть в облаке за день
     python zoom_pull.py --date 11.08.26 --at 08:55   забрать эту встречу
     python zoom_pull.py --json --days 7          то же самое для агента
-    python zoom_pull.py --meeting <uuid> --json  звук и транскрипт Zoom ЭТОГО
+    python zoom_pull.py --meeting <uuid> --json  звук и текст с именами ЭТОГО
                                                  экземпляра встречи (#450, автомат)
 
 ═══ ЗАЧЕМ ═══
@@ -70,17 +70,36 @@
 Zoom `GMT…_Recording.vtt` рядом. Одно имя — не красота: `meeting.find_names`
 ищет имена говорящих в `*.vtt` рядом с записью, и пара с общим корнем имени
 находится как одна запись даже в общей папке с десятком прошлых планёрок.
-Транскрипта в облаке нет (Zoom его не включил или ещё не дописал — он
-появляется ПОЗЖЕ звука) — скрипт говорит об этом прямо и заканчивает кодом 0:
+Транскрипта в облаке нет — скрипт говорит об этом прямо и заканчивает кодом 0:
 звук есть, разбор пойдёт без имён, и это не отказ.
 
-Что есть транскрипт в списке файлов записи, сверено по документации Zoom, а не
-по памяти (Developer Docs, «Cloud recording» и ручка «Get meeting recordings»;
-Developer Blog «Meeting API querying tips, part 1»):
+═══ ИМЕНА — ОТ ПОМОЩНИКА, А НЕ ОТ ФАЙЛА ЗАПИСИ (#469) ═══
+
+Текстов с именами у облачной записи ДВА, и они разные. Текстовый файл записи
+(`audio_transcript` в списке файлов) Zoom готовит отдельной обработкой ПОСЛЕ
+записи: замеры 08–09.09.2026 дали от 2 до 33 минут, и от длины записи это не
+зависит. Транскрипт ПОМОЩНИКА (`GET /meetings/{экземпляр}/transcript`, он же
+Zoom Workplace → Центр → «Расшифровка») готов через 5–30 секунд после конца
+записи — раньше, чем сервер узнаёт, что запись готова.
+
+Поэтому источник имён ищется по порядку (`names_track`): помощник → файл
+записи → никак. Первая боевая планёрка 09.09.2026 показала цену прежнего
+порядка: файл записи опоздал на 2 мин 43 с, и в Библиотеку лёг текст со
+«Спикер 0–5». В `--json` источник назван полем `transcript_source`
+(`assistant` | `recording` | `none`), а `has_transcript` значит «источник имён
+есть, любой».
+
+Что есть какой файл, сверено по документации Zoom и живым запросом 09.09.2026,
+а не по памяти (Developer Docs, «Cloud recording», ручки «Get meeting
+recordings» и «Get meeting transcript»; Developer Blog «Meeting API querying
+tips, part 1»):
   · звук — `recording_type: "audio_only"`, `file_type: "M4A"`;
-  · транскрипт — `recording_type: "audio_transcript"`, `file_type:
+  · файл записи — `recording_type: "audio_transcript"`, `file_type:
     "TRANSCRIPT"`, `file_extension: "VTT"`; включается у хозяина настройкой
     «Audio transcript» облачной записи и приходит отдельным файлом;
+  · транскрипт помощника — не файл, а JSON с `download_url` (качается тем же
+    Bearer, отдаёт `text/vtt`); живёт около трёх недель (`auto_delete_date`),
+    таймкоды в нём — от начала ВСТРЕЧИ, а не записи, и сдвиг склейка ищет сама;
   · uuid экземпляра кодируется в пути ДВАЖДЫ, если начинается с «/» или
     содержит «//», иначе Zoom отвечает «Meeting does not exist» (`meeting_path`).
 
@@ -93,12 +112,18 @@ Developer Blog «Meeting API querying tips, part 1»):
 Тот же ключ Server-to-Server OAuth, что и у остального контура Zoom, — три
 строки `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET` в `.env`
 (читаются `oblako_client.settings`, окружение важнее файла — как у сервера).
-Сверх прав на встречи ключу нужны ДВА права на чтение записей:
-`cloud_recording:read:list_user_recordings:admin` (какие записи есть) и
-`cloud_recording:read:list_recording_files:admin` (файлы конкретной встречи).
-Их выдают по инструкции `Записи Zoom — чтобы помощник забирал их сам.md`. Нет
-прав — Zoom отказывает, и скрипт показывает его текст целиком, а не прячет за
-«не получилось».
+Сверх прав на встречи ключу нужны ТРИ права на чтение записей:
+`cloud_recording:read:list_user_recordings:admin` (какие записи есть),
+`cloud_recording:read:list_recording_files:admin` (файлы конкретной встречи) и
+`cloud_recording:read:meeting_transcript:admin` (транскрипт помощника — имена
+говорящих сразу). Их выдают по инструкции `Записи Zoom — чтобы помощник забирал
+их сам.md`. Нет прав — Zoom отказывает, и скрипт показывает его текст целиком, а
+не прячет за «не получилось».
+
+ТРЕТЬЕ ПРАВО — ЕДИНСТВЕННОЕ, ЧЬЁ ОТСУТСТВИЕ НЕ ОСТАНАВЛИВАЕТ РАБОТУ: без него
+имена берутся из файла записи, как раньше, и об этом сказано словами с машинным
+именем права. Молчать нельзя (человек не поймёт, почему имена приходят через
+полчаса), и падать нельзя (запись цела, а запасной путь работает).
 
 ═══ КОДЫ ВОЗВРАТА — КАК У КОНТУРА ПК ═══
 
@@ -159,6 +184,28 @@ MSK = timezone(timedelta(hours=3))
 
 TOKEN_URL = "https://zoom.us/oauth/token"
 API = "https://api.zoom.us/v2"
+
+# Откуда взялись имена говорящих — три значения и весь перечень (#469). Порядок
+# перечисления и есть порядок поиска: помощник, потом файл записи, потом никак.
+NAMES_ASSISTANT = "assistant"    # транскрипт помощника Zoom — готов сразу
+NAMES_RECORDING = "recording"    # текстовый файл записи — Zoom готовит его позже
+NAMES_NONE = "none"              # ни того, ни другого: расшифровка пойдёт без имён
+
+# Почему транскрипта помощника не будет. Обе причины — НЕ ОТКАЗ: по ним идут к
+# запасному источнику имён, а не зовут человека.
+NO_SCOPE = "scope"               # у ключа нет права на транскрипт помощника
+NO_ASSISTANT = "absent"          # помощник на этой встрече транскрипта не оставил
+
+TRANSCRIPT_SCOPE = "cloud_recording:read:meeting_transcript:admin"
+"""Третье право ключа Zoom — то самое, без которого имена приходят через полчаса
+вместо полминуты. Названо машинным именем: в кабинете Zoom права ищут строкой,
+и «право на транскрипт» человек там не найдёт."""
+
+# Коды отказа Zoom на ручке транскрипта помощника, за которыми стоит не поломка,
+# а «этой дорогой имён не будет»: 4711 — у ключа нет права (`does not contain
+# scopes`), 3322 — транскрипта у экземпляра нет вовсе.
+ZOOM_NO_SCOPE_CODE = 4711
+ZOOM_NO_TRANSCRIPT_CODE = 3322
 
 # Один текст на оба режима (по дате и по экземпляру): беда одна, лечение одно.
 NO_AUDIO = ("У этой записи нет отдельной звуковой дорожки — облако писало только видео,\n"
@@ -473,20 +520,116 @@ def transcript_track(meeting: dict, audio: dict | None):
     return max(paired or found, key=lambda item: item.get("file_size") or 0)
 
 
-def describe(meeting: dict) -> str:
-    """Строка про встречу для глаза: когда, о чём, есть ли звук отдельно."""
+def no_assistant_transcript(refusal: Refused) -> str | None:
+    """Отказ на транскрипте помощника, после которого идут к запасному источнику
+    имён, — или None, если это настоящий отказ и звать надо человека.
+
+    ДВЕ ПРИЧИНЫ ИЗ ВСЕХ. `code 4711` — у ключа нет права (Zoom отвечает 400
+    «Invalid access token, does not contain scopes»): дорога закрыта, но запись
+    цела и текстовый файл записи придёт как прежде. `code 3322` — транскрипта у
+    этого экземпляра нет: помощник на встрече не работал или хозяин аккаунта
+    запретил хранить расшифровки. 404 — та же беда другими словами: ручка
+    транскрипта отвечает им, когда транскрипта нет, а самого экземпляра здесь
+    быть не может — карточку записи мы уже получили.
+
+    ВСЁ ОСТАЛЬНОЕ — ОТКАЗ. 401 (мёртвый ключ), 429 (перебор запросов), 5xx: их
+    не лечит ни ожидание, ни запасной путь, и молчаливый переход к файлу записи
+    спрятал бы поломку ключа за словами «имена не сшиты». Тот же ответ, что у
+    отказа на списке записей: чинит человек.
+
+    СУДИТСЯ ПО ТЕКСТУ, а не по разобранному полю, — как и у соседа
+    (`no_such_meeting`): тело ответа Zoom приезжает сюда уже строкой, `_open`
+    складывает его в текст беды и обрезает до 500 знаков. По той же обрезке
+    признаков права ДВА: номер `4711` и английская фраза «does not contain
+    scopes». Длинный список запрошенных прав в теле умеет вытолкнуть номер за
+    границу обрезки, и одна проверка из двух тогда промолчала бы.
+    """
+    if refusal.status == 404:
+        return NO_ASSISTANT
+    text = str(refusal)
+    if re.search(rf'"code"\s*:\s*{ZOOM_NO_SCOPE_CODE}', text) or "does not contain scopes" in text:
+        return NO_SCOPE
+    if re.search(rf'"code"\s*:\s*{ZOOM_NO_TRANSCRIPT_CODE}', text):
+        return NO_ASSISTANT
+    return None
+
+
+def assistant_transcript(token: str, ref: str) -> tuple[dict | None, str | None]:
+    """Транскрипт ПОМОЩНИКА Zoom этого экземпляра: (дорожка, почему её нет).
+
+    ПОЧЕМУ ИМЕНА БЕРУТСЯ ЗДЕСЬ, А НЕ ИЗ ФАЙЛА ЗАПИСИ (#469) — шапка модуля,
+    раздел «ИМЕНА — ОТ ПОМОЩНИКА, А НЕ ОТ ФАЙЛА ЗАПИСИ»: там оба срока замерены
+    и названа цена прежнего порядка. Второй копии рассказа тут не заводится.
+
+    ОТВЕТ РУЧКИ — НЕ ФАЙЛ, А АДРЕС. `GET /meetings/{экземпляр}/transcript`
+    отдаёт JSON с `download_url` (качается тем же Bearer, отдаёт `text/vtt`),
+    `can_download` и `auto_delete_date`: транскрипт живёт около трёх недель.
+    Размера файла в ответе нет — `file_size` здесь 0, и сверять скачанному
+    нечего; для VTT в несколько десятков килобайт это не потеря, а вот у звука
+    такая сверка держит целость записи (`download`).
+
+    РЕПЛИКИ ЖДУТ ТЕ ЖЕ: «Имя: текст», таймкоды — от начала ВСТРЕЧИ, а не
+    записи. Сдвиг (обычно 2–4 минуты) склейка ищет сама, и предела ±30 минут
+    ей хватает с запасом (`zoom_deepgram_merge.best_offset`).
+    """
+    try:
+        answer = api_get(f"/meetings/{meeting_path(ref)}/transcript", token)
+    except Refused as refusal:
+        why = no_assistant_transcript(refusal)
+        if why is None:
+            raise
+        return None, why
+    url = (answer.get("download_url") or "").strip()
+    # `can_download: false` — адрес есть, а брать по нему нечего: хозяин аккаунта
+    # закрыл скачивание расшифровок. Для нас это то же, что «транскрипта нет».
+    if not url or answer.get("can_download") is False:
+        return None, NO_ASSISTANT
+    return {"download_url": url, "file_size": 0,
+            "recording_type": "assistant_transcript"}, None
+
+
+# Как называется источник имён для глаза. Словарь ОДИН на все места, где об
+# источнике говорят словами: строка встречи, ответ забора, проверка права в
+# мастере. Разойдись они — человек, которому инструкция велит искать «имена:
+# транскрипт помощника», не нашёл бы этих слов там, куда его послали.
+SOURCE_WORDS = {
+    NAMES_ASSISTANT: "имена: транскрипт помощника",
+    NAMES_RECORDING: "имена: текстовый файл записи",
+    NAMES_NONE: "имён нет",
+}
+
+
+def describe(meeting: dict, source: str | None = None) -> str:
+    """Строка про встречу для глаза: когда, о чём, есть ли звук отдельно.
+
+    ПРО ИМЕНА ГОВОРИТСЯ, ТОЛЬКО КОГДА ПОМОЩНИК УЖЕ СПРОШЕН (``source``). В
+    списке за месяц его не спрашивают — это был бы запрос на каждую строку, — и
+    судить по одному списку файлов записи нельзя: строка «имён нет» у встречи,
+    у которой транскрипт помощника есть, врала бы человеку в лицо. Прежняя
+    пометка «транскрипт Zoom есть» врала так же, только тише.
+    """
     when = started_msk(meeting)
     stamp = when.strftime("%d.%m.%y %H:%M") if when else "время неизвестно"
     track = audio_track(meeting)
     size = f"{round((track.get('file_size') or 0) / 1048576)} МБ" if track else "звука нет"
-    names = ", транскрипт Zoom есть" if transcript_track(meeting, track) else ""
+    names = f", {SOURCE_WORDS[source]}" if source is not None else ""
     return f"{stamp}  «{meeting.get('topic') or 'без темы'}»  {size}{names}"
 
 
-def as_data(meeting: dict) -> dict:
-    """Встреча для агента: то же, что видит глаз, но полями."""
+def as_data(meeting: dict, source: str | None = None) -> dict:
+    """Встреча для агента: то же, что видит глаз, но полями.
+
+    ``source`` — откуда на самом деле взялись имена, когда это уже известно
+    (`fetch_pair` спросил помощника). Без него источником считается только файл
+    записи: спрашивать помощника ради каждой строки списка за месяц значило бы
+    столько же запросов к Zoom, сколько записей, — а список смотрят глазами.
+    `has_transcript` при этом значит «источник имён есть, любой»: читателю
+    (автомат, скилл) важно не какой файл, а будут ли имена.
+    """
     when = started_msk(meeting)
     track = audio_track(meeting)
+    names = source if source is not None else (
+        NAMES_RECORDING if transcript_track(meeting, track) else NAMES_NONE)
     return {
         "id": str(meeting.get("id") or ""),
         "uuid": meeting.get("uuid") or "",
@@ -495,7 +638,8 @@ def as_data(meeting: dict) -> dict:
         "at": when.strftime("%H:%M") if when else None,
         "size_mb": round((track.get("file_size") or 0) / 1048576) if track else 0,
         "has_audio": track is not None,
-        "has_transcript": transcript_track(meeting, track) is not None,
+        "has_transcript": names != NAMES_NONE,
+        "transcript_source": names,
     }
 
 
@@ -599,6 +743,19 @@ def target_dir(env: dict, stated) -> Path:
 # ---------------------------------------------------------------------------
 # Скачивание
 # ---------------------------------------------------------------------------
+def said_length(response) -> int:
+    """Сколько байт обещал ответ (`Content-Length`) — или 0, если не обещал.
+
+    Заголовка может не быть (сжатие, чанки), а у подделок в тестах нет и самих
+    заголовков: обещания нет — сверять нечего, и это не беда.
+    """
+    headers = getattr(response, "headers", None)
+    try:
+        return int(headers.get("Content-Length")) if headers is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def download(track: dict, target: Path, token: str, quiet: bool = False) -> None:
     """Дорожка → файл. Качаем в `.part` и переименовываем в самом конце.
 
@@ -611,6 +768,13 @@ def download(track: dict, target: Path, token: str, quiet: bool = False) -> None
     `.part` при расхождении остаётся `.part` — в разбор он не попадёт, его
     расширения нет в списке звуковых.
 
+    РАЗМЕР СПРАШИВАЕТСЯ И У ОТВЕТА, а не только у карточки файла (#469).
+    Транскрипт помощника Zoom приезжает по адресу, у которого размера в карточке
+    НЕТ вовсе, — и без второго источника сверять было бы нечего: оборванный VTT
+    молча дал бы половину имён, а разбор принял бы его за целый. `Content-Length`
+    отдаёт тот же ответ, из которого читаются байты; нет и его (сжатие, чанки) —
+    сверка пропускается, как и раньше.
+
     Обрыв посреди чтения — это «сервер не ответил», а не «нечего качать»: без
     своей обработки он вышел бы наружу голым исключением с кодом 1, и агент
     прочитал бы отказ сети как «записи нет» и не повторил бы попытку.
@@ -622,6 +786,7 @@ def download(track: dict, target: Path, token: str, quiet: bool = False) -> None
     got = 0
     try:
         with _open(request, timeout=TIMEOUT * 10) as response, part.open("wb") as sink:
+            expected = expected or said_length(response)
             while True:
                 chunk = response.read(1 << 20)
                 if not chunk:
@@ -657,28 +822,80 @@ def parse_args(argv):
     parser.add_argument("--force", action="store_true", help="скачать заново поверх готового файла")
     parser.add_argument("--to", help="папка для записи (по умолчанию — первая из OBLAKO_AUDIO_DIRS)")
     parser.add_argument("--meeting", metavar="UUID|НОМЕР",
-                        help="экземпляр встречи: звук и транскрипт Zoom именно его, без выбора по дате")
+                        help="экземпляр встречи: звук и текст с именами именно его, без выбора по дате")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                         help="с --meeting: показать, куда лягут файлы, в сеть не ходить")
     return parser.parse_args(argv)
 
 
+def names_track(meeting: dict, audio: dict | None,
+                token: str) -> tuple[dict | None, str, str | None]:
+    """Откуда брать имена говорящих: (дорожка, источник, чего не хватило).
+
+    ПОРЯДОК ИСТОЧНИКОВ И ЕСТЬ ПРАВИЛО (#469): транскрипт помощника → текстовый
+    файл записи → никак. Почему именно в таком порядке — шапка модуля, раздел
+    «ИМЕНА — ОТ ПОМОЩНИКА, А НЕ ОТ ФАЙЛА ЗАПИСИ».
+
+    ЗАПАСНОЙ ПУТЬ ОСТАЁТСЯ ЖИВЫМ, и это не вежливость к прошлому: права на
+    транскрипт помощника у ключа может не быть (его выдают отдельно), а
+    помощника на встрече могли выключить. Тогда файл записи — единственные
+    имена, какие будут.
+    """
+    assistant, missing = assistant_transcript(token, str(meeting.get("uuid") or ""))
+    if assistant is not None:
+        return assistant, NAMES_ASSISTANT, None
+    fallback = transcript_track(meeting, audio)
+    if fallback is not None:
+        return fallback, NAMES_RECORDING, missing
+    return None, NAMES_NONE, missing
+
+
+def why_no_names(source: str, missing: str | None) -> str | None:
+    """Что сказать про имена, когда взяли не лучший источник или не взяли вовсе.
+
+    Молчание здесь стоит дорого в обе стороны: без него человек не узнает, что
+    транскрипт помощника закрыт правом (имена придут через полчаса, а не сразу),
+    и не поймёт, почему в расшифровке «Спикер N». Право названо машинным именем —
+    в кабинете Zoom его ищут строкой.
+    """
+    no_scope = (f"У ключа Zoom нет права {TRANSCRIPT_SCOPE} — транскрипт помощника "
+                f"(готов сразу) закрыт.\nВыдай право по файлу «Записи Zoom — чтобы "
+                f"помощник забирал их сам.md», шаг 1.")
+    if source == NAMES_RECORDING:
+        return no_scope if missing == NO_SCOPE else None
+    if source == NAMES_NONE:
+        head = ("Имён у этой записи взять негде: ни транскрипта помощника, ни текстового "
+                "файла записи.\nОблако их не включило или ещё не дописало (файл записи "
+                "появляется позже звука).\nРасшифровка пойдёт без имён; повторный запуск "
+                "заберёт транскрипт, когда он появится.")
+        return f"{no_scope}\n{head}" if missing == NO_SCOPE else head
+    return None
+
+
 def fetch_pair(meeting: dict, folder: Path, token: str, force: bool, quiet: bool) -> dict:
     """Звук и транскрипт экземпляра → два файла с одним корнем имени.
 
-    Возвращает, что вышло: пути и слово «why» про транскрипт, если его нет.
-    Готовый файл того же размера второй раз не качается — как и в режиме по дате.
-    `quiet` — для `--json`: агент читает вывод целиком как JSON, и строка
-    «качаю… 12 МБ» посреди него сломала бы разбор ответа.
+    Возвращает, что вышло: пути, источник имён и слово «why», если взят не
+    лучший источник или имён нет вовсе. Готовый файл того же размера второй раз
+    не качается — как и в режиме по дате; у транскрипта помощника размер в
+    ответе Zoom не приходит, и он берётся заново каждый запуск (десятки
+    килобайт — `assistant_transcript`). `quiet` — для `--json`: агент читает
+    вывод целиком как JSON, и строка «качаю… 12 МБ» посреди него сломала бы
+    разбор ответа.
+
+    ИМЕНА СПРАШИВАЮТСЯ ДО СКАЧИВАНИЯ. Отказ ключу (401, 429) вылетает отсюда
+    тем же кодом, что и отказ на списке записей, — и вылетает раньше, чем
+    потрачен трафик на звук, который всё равно не забрать тем же мёртвым ключом.
     """
     say = (lambda text: None) if quiet else print
     audio = audio_track(meeting)
     if audio is None:
         raise Usage(NO_AUDIO)
-    names = transcript_track(meeting, audio)
+    names, source, missing = names_track(meeting, audio, token)
     target = folder / file_name(meeting, audio)
     folder.mkdir(parents=True, exist_ok=True)
-    got = {"audio": target, "transcript": None, "why": None}
+    got = {"audio": target, "transcript": None, "transcript_source": source,
+           "why": why_no_names(source, missing)}
     for track, path in ((audio, target), (names, target.with_suffix(".vtt"))):
         if track is None:
             continue
@@ -690,11 +907,8 @@ def fetch_pair(meeting: dict, folder: Path, token: str, force: bool, quiet: bool
             say(f"Готово: {path}")
         if track is names:
             got["transcript"] = path
-    if names is None:
-        got["why"] = ("Транскрипта Zoom у этой записи нет: облако его не включило или ещё "
-                      "не дописало (он появляется позже звука). Имена говорящих не сшить — "
-                      "расшифровка пойдёт без них; повторный запуск заберёт транскрипт, "
-                      "когда он появится.")
+    say(SOURCE_WORDS[source].capitalize())
+    if got["why"]:
         say(got["why"])
     return got
 
@@ -714,17 +928,28 @@ def run_meeting(args, env: dict) -> int:
     token = access_token(env)
     meeting = instance(token, args.meeting)
     if args.list:
+        # ИМЕНА СПРАШИВАЮТСЯ И ЗДЕСЬ, хотя ничего не качается: этим же вызовом
+        # проверяют право на транскрипт помощника (мастер «подключи автомат»,
+        # `setup_check.py`). Без вопроса «право есть?» отвечалось бы молчанием,
+        # а стоит он одного запроса к Zoom.
+        _, source, missing = names_track(meeting, audio_track(meeting), token)
+        note = why_no_names(source, missing)
         if args.as_json:
-            print(json.dumps({"meeting": as_data(meeting)}, ensure_ascii=False, indent=2))
+            print(json.dumps({"meeting": as_data(meeting, source), "note": note},
+                             ensure_ascii=False, indent=2))
         else:
-            print("Встреча: " + describe(meeting))
+            print("Встреча: " + describe(meeting, source))
+            if note:
+                print(note)
         return OK
     if not args.as_json:
         print("Встреча: " + describe(meeting))
     got = fetch_pair(meeting, folder, token, args.force, quiet=args.as_json)
     if args.as_json:
-        print(json.dumps({"meeting": as_data(meeting), "audio": str(got["audio"]),
+        print(json.dumps({"meeting": as_data(meeting, got["transcript_source"]),
+                          "audio": str(got["audio"]),
                           "transcript": str(got["transcript"]) if got["transcript"] else None,
+                          "transcript_source": got["transcript_source"],
                           "note": got["why"]}, ensure_ascii=False, indent=2))
     return OK
 

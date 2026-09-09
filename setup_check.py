@@ -13,6 +13,8 @@
     Python          версия интерпретатора, на котором всё это запущено
     .env            файл нашёлся, три значения на месте, ключ не испорчен
     Deepgram        КАБИНЕТ принял ключ — а не «строка непустая»
+    Zoom            у ключа есть право на транскрипт помощника — иначе имена
+                    говорящих придут через полчаса или не придут вовсе
     папки           `Разборы` и `Аудио` есть (нет — заводим тут же)
     команды агенту  указатели разложены и не устарели
     Библиотека      клоны на месте, `origin` наш, имя автора задано
@@ -56,6 +58,7 @@ import fetch_tasks
 import install_skills
 import meeting
 import oblako_client as client
+import zoom_pull
 
 SCRIPT = Path(__file__).resolve()
 # Корень работы спрашивается у `oblako_client.work_root` — того же места, что
@@ -79,7 +82,7 @@ AUTOMATON_TEMPLATE = Path("Автомат") / "расшифровка.md"
 ZOOM_KEY_ENVS = ("ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET")
 """Три строки ключа Zoom — те же, что читает `zoom_pull.access_token`. Здесь они
 названы ещё раз не ради проверки самого ключа (её делает `zoom_pull.py --list`),
-а как признак: без ключа с двумя правами на записи автомату нечего забирать."""
+а как признак: без ключа с тремя правами на записи автомату нечего забирать."""
 
 DEEPGRAM_PROJECTS = "https://api.deepgram.com/v1/projects"
 """Самая дешёвая дверь Deepgram: список проектов кабинета. Она ничего не
@@ -471,6 +474,59 @@ def check_deepgram(report: Report, env: dict) -> None:
                    "проверь связь и повтори")
 
 
+def check_zoom_transcript(report: Report, env: dict) -> None:
+    """Третье право ключа Zoom — живым запросом, а не «на вид» (#469).
+
+    ЗАЧЕМ ОТДЕЛЬНАЯ СТРОКА. Без права `cloud_recording:read:meeting_transcript:
+    admin` всё работает — и потому поломка не видна: запись забирается, текст
+    пишется, автомат отчитывается «готово». Не хватает только имён говорящих, а
+    заметит это человек через сутки, открыв в Библиотеке «Спикер 0–5». Ровно так
+    и вышло 09.09.2026 на первой боевой планёрке.
+
+    ПРАВО ПРОВЕРЯЕТСЯ ЗАПРОСОМ ПО ПОСЛЕДНЕЙ ЗАПИСИ, и другого способа нет: Zoom
+    не отдаёт список прав ключа. Ответ «транскрипта у этой записи нет» — тоже
+    успех: право Zoom проверяет ПЕРВЫМ, и до разговора о самом транскрипте
+    отказ по праву не доходит.
+
+    ПРОПАВШЕЕ ПРАВО НАЗЫВАЕТСЯ МАШИННЫМ ИМЕНЕМ: в кабинете Zoom права ищут
+    строкой, и «право на транскрипт» человек там не найдёт.
+    """
+    name = "Транскрипт помощника Zoom"
+    if any(not (env.get(item) or "").strip() for item in ZOOM_KEY_ENVS):
+        report.skip(name, "ключа Zoom нет — записи забирают руками")
+        return
+    since, upto = zoom_pull.window_for(None, zoom_pull.WINDOW)
+    try:
+        token = zoom_pull.access_token(env)
+        found = zoom_pull.recordings(token, since, upto)
+        fresh = next((one for one in found if (one.get("uuid") or "").strip()), None)
+        if fresh is None:
+            report.skip(name, "в облаке нет ни одной записи — право проверить не на чем")
+            return
+        _, missing = zoom_pull.assistant_transcript(token, fresh["uuid"])
+    except zoom_pull.Usage as own:
+        report.bad(name, str(own).splitlines()[0], "поправь ключ Zoom в .env")
+        return
+    except zoom_pull.Refused as refusal:
+        report.bad(name, str(refusal).splitlines()[0],
+                   "проверь права ключа Zoom: файл «Записи Zoom — чтобы помощник "
+                   "забирал их сам.md», шаг 1")
+        return
+    except zoom_pull.Silent as broken:
+        report.bad(name, str(broken).splitlines()[0], "проверь связь и повтори")
+        return
+    if missing == zoom_pull.NO_SCOPE:
+        report.bad(name, f"у ключа нет права {zoom_pull.TRANSCRIPT_SCOPE}",
+                   "кабинет Zoom → своё приложение Server-to-Server OAuth → Scopes → "
+                   "добавь это право (файл «Записи Zoom — чтобы помощник забирал их "
+                   "сам.md», шаг 1). Без него имена говорящих приходят через полчаса "
+                   "или не приходят вовсе")
+        return
+    report.ok(name, "право на месте" if missing is None
+              else "право на месте (у последней записи транскрипта нет — "
+                   "помощник на встрече не работал)")
+
+
 def check_server(report: Report, access: dict) -> None:
     """Живой вызов сервера: адрес, ключ, права и версия формата — одним махом."""
     if "url" not in access or "key" not in access:
@@ -532,6 +588,7 @@ def main(argv=None) -> int:
             print("  [—]    Сеть не проверялась (--offline)")
         else:
             check_deepgram(report, env)
+            check_zoom_transcript(report, env)
             check_server(report, access)
     except Exception:                       # трассировка — только очищенная от ключа
         return client.crash(key)
