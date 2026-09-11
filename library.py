@@ -47,6 +47,15 @@
 здесь дороже отказа: сводка розницы, легшая в папку склада, читается как
 настоящая.
 
+ПУСТОЙ РЕПОЗИТОРИЙ — НАЧАЛО РАБОТЫ, А НЕ ПОЛОМКА. «Мои встречи» заводит
+`gh repo create`, и до первой записи в них нет ни коммита, ни ветки: `pull` на
+такой копии отвечает успехом и словами «пока пусто», а первая же запись заводит
+ветку сама. Отказ здесь стоил бы человеку места расшифровок — готовность «Моих
+встреч» автомат считает КОДОМ `pull` (#488). Пустоту судит перечень веток той
+стороны (`empty_remote`), а не слова git: «ветки не нашлось» он говорит и про
+пустой репозиторий, и про тот, у которого ветку убрали, — второе остаётся
+отказом.
+
 СЕТЬ НУЖНА НЕ ВСЕМ КОМАНДАМ. `status` не ходит наружу вовсе: отставание он
 называет по последнему `pull` — иначе «покажи, как дела» зависало бы в поезде.
 `put` перед записью пробует обновиться, но неудача обновления его не
@@ -229,6 +238,11 @@ DIRTY_MARKS = ("cannot pull with rebase", "unstaged changes", "uncommitted chang
 BEHIND_MARKS = ("non-fast-forward", "fetch first", "behind its remote",
                 "updates were rejected", "[rejected]")
 NO_UPSTREAM_MARKS = ("no upstream branch", "has no upstream")
+# Ветки, которую ждал `pull`, на той стороне не нашлось. Причины две, и они
+# противоположны: репозиторий пуст — так живут заведённые `gh repo create` «Мои
+# встречи» до первой записи, — или ветку там убрали, а это беда. Слова git
+# одинаковы, поэтому их мало: различает их перечень веток Библиотеки (#488).
+EMPTY_REMOTE_MARKS = ("no such ref was fetched", "couldn't find remote ref")
 
 CONFLICT_FILE = re.compile(r"conflict \([^)]*\): merge conflict in (.+)", re.IGNORECASE)
 # Логин с паролем в любом адресе: `https://x:токен@host/…` → `https://<токен скрыт>@host/…`
@@ -466,13 +480,31 @@ def conflict_stop(repo: Repo, text: str, env: dict) -> client.ClientError:
                         f"свести автоматически нельзя", details)
 
 
-def pull_rebase(repo: Repo, env: dict) -> None:
-    """`git pull --rebase` — или понятный отказ вместо трассировки."""
+def empty_remote(repo: Repo) -> bool:
+    """Пуста ли Библиотека на той стороне — ни одной ветки.
+
+    СПРАШИВАЕТСЯ ОТДЕЛЬНО, А НЕ ЧИТАЕТСЯ ИЗ СЛОВ `pull`: «ветки не нашлось» он
+    говорит и про пустой репозиторий, и про тот, у которого ветку убрали или
+    назвали иначе. Первое — начало работы, второе — потеря; путать их нельзя.
+    """
+    result = run_git(repo.path, ["ls-remote", "--heads", "origin"])
+    return result.returncode == 0 and not output(result).strip()
+
+
+def pull_rebase(repo: Repo, env: dict) -> bool:
+    """`git pull --rebase` — или понятный отказ вместо трассировки.
+
+    Отвечает, было ли что забирать: `False` — в Библиотеке пока пусто, ни одной
+    записи в ней ещё нет. Ветка, которой не нашлось при непустой Библиотеке, —
+    по-прежнему отказ: там убрали чужую работу, и человеку надо это сказать.
+    """
     result = run_git(repo.path, ["pull", "--rebase"])
     if result.returncode == 0:
-        return
+        return True
     text = output(result)
     low = text.lower()
+    if any(mark in low for mark in EMPTY_REMOTE_MARKS) and empty_remote(repo):
+        return False
     if any(mark in low for mark in CONFLICT_MARKS):
         raise conflict_stop(repo, text, env)
     if any(mark in low for mark in DIRTY_MARKS):
@@ -711,8 +743,10 @@ def cmd_pull(args, env: dict) -> int:
         if not repo.cloned:
             clone(repo, env)
             continue
-        pull_rebase(repo, env)
-        say(f"{repo.name}: свежая копия", env)
+        if pull_rebase(repo, env):
+            say(f"{repo.name}: свежая копия", env)
+        else:
+            say(f"{repo.name}: в Библиотеке пока пусто — ни одной записи в ней ещё нет", env)
     return client.EXIT_OK
 
 
