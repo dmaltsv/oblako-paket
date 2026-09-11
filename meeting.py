@@ -357,6 +357,18 @@ def meeting_card(review: Path) -> dict | None:
     if not isinstance(one, dict) or not one.get("title"):
         return None
     job = one.get("job") if isinstance(one.get("job"), dict) else {}
+    said = one.get("transcript_place")
+    said = said if isinstance(said, dict) else {}
+    # МЕСТО: ЕСТЬ ЗАДАНИЕ — СПРАШИВАЕМ ТОЛЬКО ЕГО, нет задания — саму встречу.
+    # Разделение жёсткое, и подмешивать место встречи заданию нельзя: задание
+    # старого сервера слова о месте не знает, а автомат в этом случае читает
+    # по-старому (отдел есть — отделы, нет — совет) и в «Мои встречи» не уедет
+    # никогда. Скажи мы тогда «место встречи», `status` пообещал бы человеку
+    # одно, а текст лёг бы в другое — и разошлись бы они молча.
+    #
+    # Места нет вовсе — так и говорим: пусто. Скилл разбора на это спрашивает
+    # человека, и это честнее догадки.
+    where = job if job else said
     return {
         "id": one.get("id"),
         "title": str(one.get("title")),
@@ -366,9 +378,62 @@ def meeting_card(review: Path) -> dict | None:
         "team": (one.get("team") or {}).get("name"),
         "automaton": job.get("status"),
         "zoom_uuid": job.get("zoom_uuid"),
+        "place": where.get("place"),
+        "place_team": where.get("team"),
         "report_repo": job.get("report_repo"),
         "report_path": job.get("report_path"),
     }
+
+
+def place_repo(card: dict | None, env: dict) -> str | None:
+    """Имя репозитория, куда ляжет транскрипт этой встречи. `None` — не выбрать.
+
+    ПЕРВЫМ — ТО, ЧТО СКАЗАЛО ОТЧИТАВШЕЕСЯ ЗАДАНИЕ (`report_repo`): это факт, а не
+    вычисление, и он верен даже там, где правило с тех пор поменялось.
+
+    Дальше — тот же механический перевод места в репозиторий, каким его делает
+    автомат (`avtomat.repo_for`). Своей копии правила здесь НЕТ намеренно:
+    разойдись две, разбор на компьютере клал бы текст не туда, куда кладёт
+    автомат, и один разговор оказался бы в двух хранилищах — а заметил бы это
+    человек через полгода, не найдя расшифровку там, где искал.
+
+    Репозитория среди адресов нет (адрес «Моих встреч» не вписан, Библиотека не
+    настроена) — `None`, и вызывающий скажет об этом словами. Отказ здесь не
+    беда: разбор от Библиотеки не зависит.
+    """
+    if not card:
+        return None
+    named = str(card.get("report_repo") or "").strip()
+    if named:
+        return named
+    if not card.get("place"):
+        return None
+    try:
+        return avtomat.repo_for(card.get("place"), card.get("place_team"), env).name
+    except (avtomat.Stop, client.ClientError):
+        return None
+
+
+def place_line(st: dict) -> str:
+    """Место транскрипта словами: куда ляжет и в какой репозиторий. Пусто — не
+    названо (старый сервер, карточки нет), и строки в `status` не будет.
+
+    Слова берутся у автомата (`avtomat.PLACE_WORDS`), а не пишутся здесь:
+    таблица одна на весь контур ПК, иначе одно и то же место называлось бы
+    человеку по-разному в двух командах.
+    """
+    said = avtomat.PLACE_WORDS.get(st.get("place"))
+    if not said:
+        return ""
+    if st.get("place") == avtomat.TEAM_PLACE and st.get("place_team"):
+        said = f"{said} {st['place_team']}"
+    repo = st.get("place_repo")
+    if repo:
+        return f"{said} → {repo}"
+    # ПРИЧИНУ НЕ НАЗЫВАЕМ ТОЧНО, и это честнее: репозитория может не быть среди
+    # адресов, а может подойти сразу несколько — обе беды чинит человек, и обе
+    # чинятся одним и тем же, адресами Библиотеки в `.env`.
+    return f"{said} — репозиторий не выбран (смотри адреса Библиотеки)"
 
 
 def reported_transcript(found: list, card: dict | None) -> Path | None:
@@ -586,6 +651,14 @@ def state(review: Path, env: dict, when: date) -> dict:
         "folder": str(review),
         "date": when.strftime(DATE_FMT),
         "meeting": card,
+        # МЕСТО ТРАНСКРИПТА И ЕГО РЕПОЗИТОРИЙ (#480). Отдельными ключами, а не
+        # внутри карточки: их читает скилл разбора, собирая `library.py put`, —
+        # и собирает он из состояния, а не из своей памяти о том, как устроена
+        # Библиотека. Иначе один и тот же разговор ложился бы то в совет, то в
+        # «Мои встречи» — смотря кто его расшифровал.
+        "place": (card or {}).get("place"),
+        "place_team": (card or {}).get("place_team"),
+        "place_repo": place_repo(card, env),
         "audio": str(audio) if audio else None,
         "searched": [str(item) for item in searched],
         "transcript": transcript is not None,
@@ -677,8 +750,21 @@ def next_step(st: dict) -> tuple:
     # — всегда, это шаг разбора; 1:1 и разовая — по решению организатора (Р16),
     # и разбор без этого закончен. Взятый ИЗ Библиотеки текст класть некуда.
     if st["library"] and st["transcript_here"] and not st["transcript_in_library"]:
-        put = ('library.py put --repo <имя> --kind transcript --date <ГГГГ-ММ-ДД> '
-               '--title "<название встречи>" [--team "<Отдел>"] --word "<слово человека>" '
+        # Репозиторий и отдел берутся ИЗ МЕСТА, а не оставляются агенту угадывать
+        # (#480): место посчитано тем же правилом, что у автомата, и подсказка
+        # обязана называть его же.
+        #
+        # `--team` ОПУСКАЕТСЯ ТОЛЬКО У КОРНЕВЫХ МЕСТ — совета и «Моих встреч»:
+        # им отдел не нужен. Во всех прочих случаях (отдел назван местом, но
+        # имени его не приехало; места нет вовсе) печатаются скобки-заглушка, и
+        # агент спросит. Промолчи мы здесь — команда ушла бы без обязательного
+        # флага и отказала бы, не сказав, чего ей не хватает.
+        team = (f' --team "{st["place_team"]}"' if st["place_team"] else
+                "" if st["place"] in (avtomat.COUNCIL_PLACE, avtomat.PERSONAL_PLACE)
+                else ' [--team "<Отдел>"]')
+        put = (f'library.py put --repo {st["place_repo"] or "<имя>"} --kind transcript '
+               f'--date <ГГГГ-ММ-ДД> --title "<название встречи>"{team} '
+               f'--word "<слово человека>" '
                f'--file "{st["transcript_file"]}", затем library.py push')
         if st["kind"] == "планёрка":
             return "library", f"{finished} Осталось положить транскрипт в Библиотеку: {put}"
@@ -706,6 +792,9 @@ def cmd_status(args, env: dict) -> int:
     if card:
         print(f"  ✔ встреча       #{card['id']} «{card['title']}» {card['start_time'] or ''} · "
               f"{card['team'] or 'совет / без отдела'} · автомат: {card['automaton'] or 'не было'}")
+    where = place_line(st)
+    if where:
+        print(f"  ✔ место         {where}")
     print(f"  {done[bool(st['audio'] or st['transcript'])]} запись        "
           f"{st['audio'] or ('уже расшифрована' if st['transcript'] else 'не найдена')}")
     if st["transcript_here"] or not st["transcript"]:
@@ -957,12 +1046,22 @@ def _task_index(person: dict) -> dict:
     return {task.get("id"): task for task in (person.get("open_tasks") or [])}
 
 
+NO_DATE = "без даты"
+
+
 def _dates_of(item: dict) -> str:
     """Даты пункта словами. У новой задачи и у правки они значат РАЗНОЕ.
 
     В `add` пустая дата — просто её отсутствие. В `edit` у обеих дат три
     состояния, и `null` там — «снять»; показать его как «нет даты» значило бы
     спрятать от человека снятие срока, которое он подтверждает словом «запиши».
+
+    НОВАЯ ЗАДАЧА БЕЗ ОБЕИХ ДАТ НАЗЫВАЕТСЯ ВСЛУХ (#473, #480). Такая задача
+    законна: на планёрке «займись складом» звучит чаще, чем дата, и срок за
+    человека не выдумывают — он ляжет получателю в «Не запланировано». Но пустое место в
+    строке превью читается как «дата есть, просто не показали», и руководитель
+    узнал бы правду уже после слова «запиши». Поэтому — слово, а не пустота.
+    У правки такого слова нет: там пустой хвост означает «даты не трогаем».
     """
     parts = []
     for key, label in (("due", "рабочий день"), ("deadline", "дедлайн")):
@@ -973,6 +1072,8 @@ def _dates_of(item: dict) -> str:
             parts.append(f"{label} {item[key] or 'снять'}")
     if "new_text" in item:
         parts.append(f"текст → «{item['new_text']}»")
+    if not parts and item.get("op") == "add":
+        return NO_DATE
     return " · ".join(parts)
 
 

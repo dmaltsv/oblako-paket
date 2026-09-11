@@ -134,6 +134,12 @@ TRANSCRIPT_FAILED = "failed"
 TRANSCRIPT_NO_RECORDING = "no_recording"
 TRANSCRIPT_OUTCOMES = (TRANSCRIPT_DONE, TRANSCRIPT_FAILED, TRANSCRIPT_NO_RECORDING)
 
+# СЛОВО О ГОТОВНОСТИ «МОИХ ВСТРЕЧ» (#475, #480) — одно имя на две двери: поле в
+# отчёте о задании и всё тело самоотчёта без задания. Имя серверное
+# (`core.MY_MEETINGS_READY_FIELD`), и второй копии у пакета нет: разойдись они,
+# сервер отверг бы отчёт незнакомым полем после часа работы автомата.
+MY_MEETINGS_FIELD = "my_meetings_ready"
+
 # Имена файлов папки разбора, которые нужны ОБОИМ клиентам. Остальные знает одна
 # механика разбора (`meeting.py`); эти два вынесены сюда потому, что гейт
 # «запиши» обязан держать и у прямого клиента: имя файла подтверждения —
@@ -165,14 +171,22 @@ class Usage(ClientError):
 
 
 class Refused(ClientError):
-    """Сервер ответил отказом: ключ, права, отдел, непрошедший проверку пакет."""
+    """Сервер ответил отказом: ключ, права, отдел, непрошедший проверку пакет.
+
+    ИМЯ ПОЛЯ ДОЕЗЖАЕТ ОТДЕЛЬНЫМ ПРИЗНАКОМ, а не только внутри сообщения: по нему
+    отчёт автомата узнаёт отказ «такого поля у меня нет» от сервера, который
+    ещё не выкачен, и повторяет себя без этого поля. Разбирать формулировку
+    значило бы завести второго судью причины — тот же довод, что у
+    `team_without_chat` ниже.
+    """
 
     exit_code = EXIT_REFUSED
 
     def __init__(self, message: str, details: Optional[list] = None,
-                 status: Optional[int] = None):
+                 status: Optional[int] = None, field: Optional[str] = None):
         super().__init__(message, details)
         self.status = status
+        self.field = field
 
 
 class Unreachable(ClientError):
@@ -813,6 +827,7 @@ def _refusal(refusal: urllib.error.HTTPError) -> ClientError:
         f"Сервер отказал (HTTP {refusal.code}): {message or 'причина не названа'}",
         details=details,
         status=refusal.code,
+        field=str(body.get("field") or "") or None,
     )
 
 
@@ -877,8 +892,45 @@ def transcripts(meeting_id: int, report: dict, *, url: str, key: str) -> dict:
         if value is None:
             continue
         body[name] = value[:TRANSCRIPT_REPORT_LINE_MAX] if isinstance(value, str) else value
+    try:
+        return _post_report(meeting_id, body, url=url, key=key)
+    except Refused as refusal:
+        # СЛОВО О ГОТОВНОСТИ — ЕДИНСТВЕННОЕ ПОЛЕ, КОТОРОЕ МОЖНО СНЯТЬ И ПОВТОРИТЬ.
+        # Пакет и сервер живут разными репозиториями, а облачная рутина клонирует
+        # пакет заново каждый запуск: выкати мы пакет раньше сервера — и сервер,
+        # ещё не знающий этого поля, отверг бы ВЕСЬ отчёт, то есть текст уже лежал
+        # бы в Библиотеке, а задание навсегда осталось бы «в полёте». Правило
+        # контура прежнее и остаётся верным: порядок выкатки не значим ни в одну
+        # сторону. Снимается ровно это поле и ровно на один повтор — остальные
+        # отказы 400 так же остаются отказами.
+        if refusal.status != 400 or refusal.field != MY_MEETINGS_FIELD:
+            raise
+        if MY_MEETINGS_FIELD not in body:
+            raise
+        body.pop(MY_MEETINGS_FIELD)
+        return _post_report(meeting_id, body, url=url, key=key)
+
+
+def _post_report(meeting_id: int, body: dict, *, url: str, key: str) -> dict:
+    """Отправить готовое тело отчёта — ШОВ к `call` для обеих попыток."""
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     return call("POST", f"/api/pc/transcripts/{int(meeting_id)}", url=url, key=key,
+                timeout=TIMEOUT_READ_SEC, body=raw)
+
+
+def my_meetings(ready: bool, *, url: str, key: str) -> dict:
+    """Самоотчёт автомата о готовности «Моих встреч» — БЕЗ ЗАДАНИЯ (#475, Р13).
+
+    Вторая дверь того же слова, и нужна она потому, что первый раз о готовности
+    говорит пробный запуск мастера «подключи автомат»: заданий в тот момент нет
+    ни одного, и сказать иначе нечем.
+
+    ТЕЛО — РОВНО ОДНО ПОЛЕ. Сервер отвергает незнакомый ключ телом целиком и
+    называет его по имени, а номер человека сюда не пишется вовсе: адресат слова
+    — хозяин ключа, и подставить другого нечем.
+    """
+    raw = json.dumps({MY_MEETINGS_FIELD: bool(ready)}, ensure_ascii=False).encode("utf-8")
+    return call("POST", "/api/pc/my-meetings", url=url, key=key,
                 timeout=TIMEOUT_READ_SEC, body=raw)
 
 
