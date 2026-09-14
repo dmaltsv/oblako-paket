@@ -67,6 +67,7 @@ import sys
 from pathlib import Path
 
 import oblako_client as client
+import strazh
 
 SCRIPT = Path(__file__).resolve()
 
@@ -254,6 +255,9 @@ def send(args, env: dict) -> int:
         return client.EXIT_OK
     # Гейт «запиши» — ДО ключа и до сети. Дверей к серверу две, и держать он
     # обязан у обеих: инструкция «пиши только в черновик» гейтом не является.
+    # Страж слова (#508) — там же и по той же причине: в облаке подтверждённый
+    # пакет на диске не значит, что человек сказал «запиши» перед отправкой.
+    strazh.require_word_in_cloud()
     client.require_confirmation(Path(args.package).expanduser(), args.team)
     key = client.access_key(env)
     # Параметр публикации едет ТОЛЬКО когда человек её отменил: сервер, не

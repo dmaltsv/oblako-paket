@@ -18,6 +18,8 @@
     Deepgram raw.json    сырой ответ Deepgram — второй раз за то же аудио не платим
     tasks.json           снимок задач с боевого сервера  (шаг «выгрузка»)
     package.draft.json   разбор агента, ещё НЕ подтверждённый человеком
+    package.first.json   первая версия черновика, положенная на сервер или взятая
+                         с него, — по ней `confirm` считает долю правок (#514)
     package.json         тот же разбор ПОСЛЕ слова «запиши» (шаг «подтверждение»)
     Подтверждение.json   отпечаток подтверждённого пакета и сказанное слово
     Ответ сервера.json   след последней отправки: чей пакет, когда, с каким кодом
@@ -44,6 +46,18 @@
 СЛОВАМИ, что скажет сервер, и держатся сквозными тестами разбора. Всё, чему
 местного ответа нет, здесь не судится вовсе.
 
+ЧЕРНОВИК РАЗБОРА ЖИВЁТ И НА СЕРВЕРЕ (#514, Р9–Р10) — без цитат и без текстов
+уточнений. В окне разбора (облако, `CLAUDE_CODE_REMOTE=true`) его кладёт `preview`
+после каждой правки: машина окна отключается при простое, и сервер — единственное
+место, где разбор её переживает; первое положение сервер превращает в письмо
+человеку «разбор готов». `status` у встречи с карточкой и без своего черновика
+спрашивает сервер и восстанавливает черновик в папку — и в окне после перезапуска
+машины, и на компьютере, куда человек сел вместо окна. На компьютере `preview`
+черновиков не кладёт: разбор там ведёт сам человек. `confirm` считает, сколько
+пунктов первой версии человек изменил, убрал или добавил, и кладёт последнюю
+версию с этими числами (Р13); в пакет он ставит номер встречи из карточки — по
+нему применение гасит черновик на сервере (#512).
+
 `Ответ сервера.json` — РАСПИСКА КЛИЕНТА, А НЕ РЕЕСТР. Правда о применённом пакете
 живёт в базе сервера, и он же судит повтор по отпечатку. Расписка нужна одному:
 чтобы `status` знал, чем кончилась прошлая отправка, не ходя в сеть. Пакет
@@ -56,7 +70,10 @@
 (`Транскрипты/<ГГГГ-ММ-ДД> <название>.md`; у отделов — внутри `Отделы/<Отдел>/`).
 Найденный текст — сделанный шаг «расшифровка», и `transcribe` его не заказывает.
 Обновить клон (`library.py pull`) — дело агента: этот скрипт в сеть за
-Библиотекой не ходит, иначе «где мы?» зависало бы в поезде. КАКОЙ ИЗ ТЕКСТОВ ДНЯ
+Библиотекой не ходит, иначе «где мы?» зависало бы в поезде. (В сеть `status`
+ходит в одном случае — за черновиком разбора на сервере, и только у встречи,
+разбор которой поставлен автомату; сеть молчит — `status` говорит это строкой
+и идёт дальше, см. `restore_draft`.) КАКОЙ ИЗ ТЕКСТОВ ДНЯ
 ПРО ЭТУ ВСТРЕЧУ, РЕШАЕТ КАРТОЧКА (`Встреча.json`, команда `meetings --pick`), а
 не скрипт, — и решает всегда, даже когда текст за день один: Библиотека общая на
 всю компанию, и единственная расшифровка «за сегодня» бывает планёркой другого
@@ -79,6 +96,7 @@
     python meeting.py confirm --date 09.08.26 --word "запиши"
     python meeting.py send    --date 09.08.26 --team Т [--dry-run] [--no-publish]
     python meeting.py publish --date 09.08.26 --team Т
+    python meeting.py strazh  [--journal Ж]
 
 Коды выхода — общие у всего контура ПК, см. `oblako_client`. Команда-скилл ходит
 по ним, а не по тексту вывода.
@@ -101,6 +119,7 @@ import fetch_tasks
 import library
 import oblako_client as client
 import send_package
+import strazh
 import transcribe
 import zoom_deepgram_merge
 
@@ -111,6 +130,38 @@ MEETING = "Встреча.json"            # карточка встречи с 
 TRANSCRIPT = "Транскрипт.md"
 TASKS = "tasks.json"
 DRAFT = "package.draft.json"
+FIRST_DRAFT = "package.first.json"  # первая версия черновика — основание доли правок
+
+# Формат пакета — то же слово, что `core.PACKAGE_FORMAT`: им подписан черновик,
+# восстановленный с сервера, а на сервере черновик хранит одни пункты.
+PACKAGE_FORMAT = "oblako-meeting-package"
+# Блок «Требует уточнения» агент пишет в черновик списком строк под этим ключом:
+# в пакет он не идёт, на сервер уезжает только число (инвариант 22).
+CLARIFICATIONS = "clarifications"
+# Номер задания черновика с сервера в блоке `meeting` пакета — то же слово, что
+# `core.PACKAGE_REVIEW_JOB_KEY`: по нему сервер судит, жив ли черновик (`package_of`).
+REVIEW_JOB_KEY = "review_job_id"
+
+# РАЗБОР БЕЗ ЕДИНОЙ ЗАДАЧИ (#521, решение руководителя 14.09.2026: «окно говорит
+# само»). Пустой пакет сервер отвергает («Пакет пуст»), и слово «запиши» над таким
+# разбором кончалось отказом уже после слова, а разбор висел «готов», пока чек-ин
+# о нём напоминает. Поэтому «запиши» здесь не просится вовсе: превью и `status`
+# говорят это словами, а `confirm` пакета не делает — правило держит скрипт, а не
+# аккуратность модели. Закрывает такой разбор кнопка человека, как любой другой.
+NO_TASKS = "В разборе нет ни одной задачи для списков — «запиши» не нужно, отправлять нечего."
+NO_TASKS_CLARIFY = (" Уточнений {count}: скажет человек сделать из них задачи — впиши "
+                    "их в черновик и покажи превью снова, тогда понадобится «запиши».")
+NO_TASKS_BUTTON = (" Задач так и нет — разбор закроет кнопка «Разбор не нужен» под "
+                   "письмом «разбор готов» или в карточке встречи; скажи это человеку.")
+NO_TASKS_DONE = " Задач так и нет — на сервер отправлять нечего."
+
+# Что сервер пишет человеку о первом черновике (#518): ссылку на окно — только
+# окну сигнала (`signalled_window`), вечерний проход идёт без неё, и письмо
+# называет, где окно искать. Превью говорит модели то же самое, что придёт.
+WINDOW_LETTER = "сервер пишет человеку «разбор готов» со ссылкой на это окно."
+SWEEP_LETTER = ("сервер пишет человеку «разбор готов» без ссылки на окно — это окно "
+                "человек найдёт в приложении Claude, раздел Code, среди запусков рутины.")
+
 # Имена подтверждённого пакета и самого подтверждения знает `oblako_client`:
 # гейт «запиши» стоит и у прямого клиента, а имя файла — половина этого гейта.
 PACKAGE = client.PACKAGE
@@ -357,6 +408,13 @@ def meeting_card(review: Path) -> dict | None:
     if not isinstance(one, dict) or not one.get("title"):
         return None
     job = one.get("job") if isinstance(one.get("job"), dict) else {}
+    # ЗАДАНИЕ РАЗБОРА — СВОИМ КЛЮЧОМ (`review_job`, #518), а не из `job`: там
+    # сервер отвечает «что с расшифровкой», и у встречи с отчитанной
+    # расшифровкой и разбором по кнопке стоит отчитанное задание расшифровки.
+    # Возьми номер оттуда — и черновик ложился бы под заданием без разбора:
+    # сервер отказывал, письма «разбор готов» не было. Ключа нет (сервер старше
+    # разбора) — разбора у встречи нет, черновик класть не к чему.
+    review_job = one.get("review_job") if isinstance(one.get("review_job"), dict) else {}
     said = one.get("transcript_place")
     said = said if isinstance(said, dict) else {}
     # МЕСТО: ЕСТЬ ЗАДАНИЕ — СПРАШИВАЕМ ТОЛЬКО ЕГО, нет задания — саму встречу.
@@ -377,6 +435,11 @@ def meeting_card(review: Path) -> dict | None:
         "organizer": (one.get("organizer") or {}).get("name"),
         "team": (one.get("team") or {}).get("name"),
         "automaton": job.get("status"),
+        # Номер задания РАЗБОРА — ключ черновика на сервере (#514, #518):
+        # положить его вправе исполнитель задания, и сервер сверяет задание со
+        # встречей.
+        "job_id": review_job.get("id"),
+        "work": review_job.get("work"),     # поставлен ли разбор (`review_ordered`)
         "zoom_uuid": job.get("zoom_uuid"),
         "place": where.get("place"),
         "place_team": where.get("team"),
@@ -583,6 +646,41 @@ def tasks_fresh(snapshot: dict | None) -> bool:
         return False
 
 
+def fresh_snapshot(review: Path) -> tuple:
+    """Снимок задач для сверки пунктов — сегодняшний: устаревший делается заново.
+
+    ПЕРЕПРОВЕРКА НАЗАВТРА (#518, спека #506: «выгрузка годна день, устаревшая
+    делается заново, превью сверяет пункты со снимком и называет расхождения до
+    слова»). Окно разбора живёт сутками: человек приходит утром, а задачу из
+    пункта `close` ночью закрыли. Сверка со вчерашним снимком сказала бы
+    «сошлось», и отказ пришёл бы только от сервера — после слова «запиши».
+    Поэтому превью и отправка сверяют со снимком, снятым сегодня, — тем же
+    отделом, по которому снят прежний (`snapshot_team`).
+
+    В ОКНЕ РАЗБОРА — СВЕЖАЯ ВЫГРУЗКА НА КАЖДУЮ СВЕРКУ (ревью #518, этап 2):
+    «сегодняшний» там не довод. Окно сделало выгрузку утром, задачу из пункта
+    `close` закрыли через час, и превью с сегодняшним снимком сказало бы
+    «сошлось» — отказ пришёл бы от сервера после слова. Сеть окну нужна и так:
+    превью кладёт черновик на сервер. На компьютере разбор идёт одним заходом,
+    выгрузка годна день (спека #506).
+
+    Отвечает парой «снимок, код»: снимка нет — `(None, 0)`, сверять нечем;
+    свежую выгрузку не взять — `(None, код)`, и сверки без неё нет.
+    """
+    snapshot = read_json(review / TASKS)
+    if snapshot is None or (tasks_fresh(snapshot) and not strazh.in_cloud()):
+        return snapshot, client.EXIT_OK
+    print("Делаю свежую выгрузку задач: сверять пункты с прежней нельзя.")
+    team = snapshot_team(review)
+    argv = ["--out", str(review / TASKS)]
+    if team and team.get("id") is not None:
+        argv += ["--team", str(team["id"])]
+    code = fetch_tasks.main(argv)
+    if code != client.EXIT_OK:
+        return None, code
+    return read_json(review / TASKS), client.EXIT_OK
+
+
 def confirmed_package(review: Path) -> bool:
     """Лежащий пакет — ТОТ САМЫЙ, что подтвердил человек словом.
 
@@ -626,9 +724,20 @@ def snapshot_fits(review: Path, selector: str | None) -> bool:
     return client.same_team(selector, team) is True
 
 
+def sent_package(review: Path) -> bool:
+    """Лежащий пакет применён сервером — по расписке ЭТОГО пакета."""
+    receipt = read_json(review / RECEIPT)
+    package = review / PACKAGE
+    applied = bool(receipt) and receipt.get("exit_code") in (client.EXIT_OK,
+                                                            client.EXIT_PUBLISH_INCOMPLETE,
+                                                            client.EXIT_NO_PUBLISH)
+    if applied and package.is_file() and receipt.get("package") != digest(package):
+        applied = False                      # пакет переписали — расписка не про него
+    return applied
+
+
 def state(review: Path, env: dict, when: date) -> dict:
     """Что уже сделано. Единственное место, где это считается."""
-    package = review / PACKAGE
     receipt = read_json(review / RECEIPT)
     snapshot = read_json(review / TASKS)
     card = meeting_card(review)
@@ -641,11 +750,7 @@ def state(review: Path, env: dict, when: date) -> dict:
     if transcript is None:
         audio, searched = find_audio(review, when, env)
 
-    applied = bool(receipt) and receipt.get("exit_code") in (client.EXIT_OK,
-                                                            client.EXIT_PUBLISH_INCOMPLETE,
-                                                            client.EXIT_NO_PUBLISH)
-    if applied and package.is_file() and receipt.get("package") != digest(package):
-        applied = False                      # пакет переписали — расписка не про него
+    applied = sent_package(review)
 
     return {
         "folder": str(review),
@@ -689,6 +794,12 @@ def state(review: Path, env: dict, when: date) -> dict:
         "tasks": tasks_fresh(snapshot),
         "tasks_stale": snapshot is not None and not tasks_fresh(snapshot),
         "draft": (review / DRAFT).is_file(),
+        # Разбор без единой задачи (#521): у него «запиши» не просится.
+        "no_tasks": no_tasks_words(review, read_json(review / DRAFT)),
+        # Черновик пришёл с сервера (#514): извлечение не повторяется, а цитат в
+        # нём нет — их агент берёт из транскрипта заново.
+        "draft_from_server": (review / DRAFT).is_file()
+        and bool((first_version(review) or {}).get("from_server")),
         "package": confirmed_package(review),
         "sent": applied,
         "published": applied and receipt.get("exit_code") == client.EXIT_OK,
@@ -703,7 +814,12 @@ def state(review: Path, env: dict, when: date) -> dict:
 def next_step(st: dict) -> tuple:
     """(ключ шага, что сделать словами). Порядок шагов задан ЗДЕСЬ и больше нигде."""
     card = st.get("meeting") or {}
-    if not st["transcript"] and st["library_candidates"]:
+    # ЧЕРНОВИК, ВЗЯТЫЙ С СЕРВЕРА, ТЕКСТА НЕ ЖДЁТ (#514): извлечение уже сделано, и
+    # следующий шаг — превью и слово. Текст нужен лишь для цитат, а платить за
+    # него Deepgram, чтобы показать готовый разбор, незачем. Выгрузку он ждёт:
+    # пункты сверяются со свежим снимком.
+    needs_text = not st["transcript"] and not st.get("draft_from_server")
+    if needs_text and st["library_candidates"]:
         # В Библиотеке за этот день лежит чужой текст (или несколько), а встреча
         # не названа. Годится ли он — решает карточка, и только она: Библиотека
         # общая, и текст «за сегодня» бывает планёркой другого отдела.
@@ -717,7 +833,7 @@ def next_step(st: dict) -> tuple:
                           "встречи, а не найдётся — разбор пойдёт к записи и расшифровке. "
                           "Этой встречи в Oblako нет вовсе (разовый созвон) — тогда "
                           "расшифровывай запись сам: meeting.py transcribe --force")
-    if not st["transcript"] and not st["audio"]:
+    if needs_text and not st["audio"]:
         hint = ("Ни готового текста в Библиотеке, ни записи. Сначала обнови Библиотеку "
                 "(library.py pull) и спроси status снова")
         if card.get("automaton") == "reported":
@@ -727,7 +843,7 @@ def next_step(st: dict) -> tuple:
                  else "(zoom_pull.py --date <ДД.ММ.ГГ>) ")
         hint += "или положи файл в папку разбора — и запусти find."
         return "recording", hint
-    if not st["transcript"]:
+    if needs_text:
         return "transcribe", "Расшифровать запись: meeting.py transcribe"
     if not st["tasks"]:
         return "tasks", "Свежая выгрузка с боевого сервера: meeting.py tasks"
@@ -735,6 +851,25 @@ def next_step(st: dict) -> tuple:
         return "extract", (f"Извлечь задачи из расшифровки ({st['transcript_file']}) и "
                            f"записать разбор в {DRAFT}. Это работа агента, скриптом её "
                            "не сделать.")
+    if not st["package"] and st.get("no_tasks"):
+        # Задач нет — но транскрипт, сделанный здесь, Библиотеке всё равно должен
+        # (Р3): у планёрки этот шаг держится, пока текст не лёг, как после отправки.
+        key, what = finish_step(st, st["no_tasks"])
+        return ("no_tasks" if key == "done" else key), (f"Показать превью (meeting.py "
+                                                         f"preview). {what}")
+    if not st["package"] and st.get("draft_from_server"):
+        # ТЕКСТ ДЛЯ ЦИТАТ — ТОЛЬКО ИЗ БИБЛИОТЕКИ (#521): шаги к записи и расшифровке
+        # у такого черновика выключены (`needs_text`), и сказать «текст найдёт
+        # status» значило бы звать по кругу — status его уже не нашёл.
+        quotes = (f"из расшифровки ({st['transcript_file']})" if st["transcript_file"]
+                  else "из текста встречи, а его на этой машине нет: обнови Библиотеку "
+                       "(library.py pull) и спроси status снова — расшифровывать запись "
+                       "заново не нужно")
+        return "confirm", ("Черновик разбора взят с сервера — извлечение не повторять: "
+                           "показать превью (meeting.py preview) и ждать слова человека. "
+                           f"Цитат в нём нет: для показа и `description` возьми их {quotes}; "
+                           "вид встречи (`meeting.kind`) впиши в черновик сам. "
+                           'Сказал «запиши» — meeting.py confirm --word "<его слова>"')
     if not st["package"]:
         return "confirm", ('Показать превью (meeting.py preview) и ждать слова человека. '
                            'Сказал «запиши» — meeting.py confirm --word "<его слова>"')
@@ -743,9 +878,17 @@ def next_step(st: dict) -> tuple:
     if not st["publish_off"] and not st["published"]:
         return "publish", ("Итог в группе неполон — досдать: "
                            "meeting.py publish --team <отдел>")
-    finished = ("Разбор закончен: задачи применены, публиковать итог было некуда — у "
-                "отдела нет группового чата." if st["publish_off"]
-                else "Разбор доведён до публикации.")
+    return finish_step(st, "Разбор закончен: задачи применены, публиковать итог было "
+                           "некуда — у отдела нет группового чата." if st["publish_off"]
+                       else "Разбор доведён до публикации.")
+
+
+def finish_step(st: dict, finished: str) -> tuple:
+    """Последний шаг разбора — транскрипт в Библиотеку, если он ей должен, иначе «done».
+
+    ``finished`` — слова о том, чем разбор закончился: отправкой или тем, что
+    задач нет (#521). Библиотеке транскрипт должен одинаково в обоих случаях.
+    """
     # Транскрипт, сделанный здесь, — в Библиотеку (Р3). Планёрка отдела и совет
     # — всегда, это шаг разбора; 1:1 и разовая — по решению организатора (Р16),
     # и разбор без этого закончен. Взятый ИЗ Библиотеки текст класть некуда.
@@ -774,20 +917,300 @@ def next_step(st: dict) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Черновик разбора на сервере (#514)
+# ---------------------------------------------------------------------------
+def package_of(review: Path, body: dict) -> dict:
+    """Пакет из черновика: без списка уточнений, С НОМЕРОМ ВСТРЕЧИ из карточки и
+    номером задания черновика с сервера.
+
+    Уточнения в пакет не идут: их тексты на сервер не едут (инвариант 22), а в
+    пакете они меняли бы и его отпечаток. Номер встречи (`meeting.id`, #512) —
+    по нему применение пакета гасит живой черновик разбора этой встречи; ставит
+    его скрипт из карточки, а не агент по памяти: без номера применённый разбор
+    остался бы на сервере «готов» и звал бы человека в чек-ине. Карточки нет —
+    номера нет, и пакет применяется, как всегда.
+
+    НОМЕР ЗАДАНИЯ (`meeting.review_job_id`) — только у черновика с сервера
+    (`server_draft_job`): по нему сервер судит, жив ли ещё этот черновик, и пакет
+    закрытого разбора — кнопкой «Разбор не нужен», чужим пакетом, «не вышло» —
+    не применяет, через какую бы дверь его ни отправили.
+    """
+    package = {key: value for key, value in body.items() if key != CLARIFICATIONS}
+    number = (meeting_card(review) or {}).get("id")
+    if number:
+        meeting = package.get("meeting") if isinstance(package.get("meeting"), dict) else {}
+        package["meeting"] = {**meeting, "id": number}
+        job_id = server_draft_job(review)
+        if job_id:
+            package["meeting"][REVIEW_JOB_KEY] = job_id
+    return package
+
+
+def no_tasks_words(review: Path, body) -> str | None:
+    """Слова «задач нет» у черновика без единого пункта — иначе None (#521).
+
+    Уточнения названы числом: из них человек словами делает задачи, и тогда
+    разбор перестаёт быть пустым. Кнопку «Разбор не нужен» слова называют только
+    у разбора, поставленного автомату (`review_ordered`): у ручного разбора на
+    компьютере её нет, и он без задач просто закончен. Черновика нет или он не
+    объект — не судим: об этом скажут другие шаги.
+    """
+    if not isinstance(body, dict) or body.get("items"):
+        return None
+    listed = body.get(CLARIFICATIONS)
+    words = NO_TASKS
+    if isinstance(listed, list) and listed:
+        words += NO_TASKS_CLARIFY.format(count=len(listed))
+    return words + (NO_TASKS_BUTTON if review_ordered(meeting_card(review)) else NO_TASKS_DONE)
+
+
+def bare_items(body: dict) -> list:
+    """Пункты черновика БЕЗ ЦИТАТ — то, что уезжает на сервер (инвариант 22).
+
+    Цитата срезается здесь, а не остаётся на совести агента: сервер ключ
+    `description` в черновике отвергает поимённо, и без среза каждое превью
+    окна кончалось бы отказом. Пункты, которые не объекты, едут как есть — их
+    судит сервер и называет словами.
+    """
+    return [{key: value for key, value in item.items() if key != "description"}
+            if isinstance(item, dict) else item
+            for item in (body.get("items") or [])]
+
+
+def review_ordered(card: dict | None) -> bool:
+    """Поставлен ли разбор заданию из карточки — есть ли у встречи черновик на сервере.
+
+    Черновик бывает только у задания с разбором (`transcript_review`, `review`):
+    у встречи без задания или с одной расшифровкой спрашивать и класть нечего, а
+    вопрос стоил бы сети каждому `status`. Карточка старого сервера слова о
+    составе работы не несёт — у такого сервера нет и ручек черновика.
+    """
+    return bool(card and card.get("id") and card.get("job_id")
+                and card.get("work") in (avtomat.TRANSCRIPT_REVIEW_WORK, avtomat.REVIEW_WORK))
+
+
+def first_version(review: Path) -> dict | None:
+    """Первая версия черновика (`package.first.json`) — или None, если её нет.
+
+    Ключи: `items` — пункты первой версии без цитат; `job_id` — задание, которому
+    черновик принадлежит; `from_server` — взята с сервера, а не положена отсюда;
+    `edits` и `total_first` — числа, накопленные окном ДО этой версии (только у
+    черновика, восстановленного в облаке, см. `restore_draft`).
+    """
+    first = read_json(review / FIRST_DRAFT)
+    if not isinstance(first, dict) or not isinstance(first.get("items"), list):
+        return None
+    return first
+
+
+def write_first(review: Path, items: list, *, job_id, from_server: bool,
+                edits: int = 0, total_first: int | None = None) -> None:
+    """Записать первую версию черновика. Ключи — у `first_version`."""
+    first = {"items": items, "job_id": job_id, "from_server": from_server}
+    if total_first is not None:
+        first.update(edits=edits, total_first=total_first)
+    (review / FIRST_DRAFT).write_text(json.dumps(first, ensure_ascii=False, indent=2),
+                                      encoding="utf-8")
+
+
+def _whole(item) -> str:
+    return json.dumps(item, ensure_ascii=False, sort_keys=True)
+
+
+def _same_task(item):
+    if isinstance(item, dict) and item.get("op") in ("close", "edit"):
+        return item.get("task_id")
+    return None
+
+
+def _same_new_text(item):
+    if isinstance(item, dict) and item.get("op") == "add":
+        return item.get("person_id"), item.get("text")
+    return None
+
+
+def _same_new_person(item):
+    if isinstance(item, dict) and item.get("op") == "add":
+        return item.get("person_id")
+    return None
+
+
+def _pair_off(left: list, right: list, key) -> int:
+    """Снять с обеих сторон пары с одинаковым ключом, по порядку. Число пар."""
+    pairs = 0
+    for item in list(right):
+        mark = key(item)
+        if mark is None:
+            continue
+        for number, old in enumerate(left):
+            if key(old) == mark:
+                del left[number]
+                right.remove(item)
+                pairs += 1
+                break
+    return pairs
+
+
+def count_edits(first: list, items: list) -> int:
+    """Сколько пунктов первой версии человек изменил, убрал или добавил (Р13).
+
+    Пункты сравниваются БЕЗ ЦИТАТ: поправленная цитата — не правка задачи, а доля
+    правок меряет, насколько автомат угадал сами задачи. Пары снимаются от
+    сильного признака к слабому:
+
+        1. пункт не тронут вовсе — не правка;
+        2. та же задача (`task_id` у закрытия и правки, даже если закрытие стало
+           правкой) — одна правка;
+        3. новая задача того же человека с тем же текстом — поправлены даты;
+        4. новая задача того же человека — поправлена формулировка.
+
+    Всё, что осталось без пары, — убрано (из первой версии) или добавлено
+    (в последней). Перенос новой задачи на другого человека считается двумя
+    правками: убрана у одного, добавлена другому, — и так это человек и видит.
+    """
+    left = bare_items({"items": first})
+    right = bare_items({"items": items})
+    _pair_off(left, right, _whole)
+    changed = (_pair_off(left, right, _same_task)
+               + _pair_off(left, right, _same_new_text)
+               + _pair_off(left, right, _same_new_person))
+    return changed + len(left) + len(right)
+
+
+def draft_numbers(review: Path, body: dict) -> dict:
+    """Числа черновика для сервера: уточнения, правки, пункты первой версии.
+
+    Первой версии ещё нет — это она и есть: правок ноль, пунктов — сколько есть.
+    Первая версия несёт числа, накопленные окном до неё (восстановление в
+    облаке), — правки прибавляются к ним, а пункты первой версии берутся оттуда.
+    """
+    first = first_version(review) or {}
+    items = bare_items(body)
+    base = first.get("items", items)
+    listed = body.get(CLARIFICATIONS)
+    return {"clarifications": len(listed) if isinstance(listed, list) else 0,
+            "edits": int(first.get("edits") or 0) + count_edits(base, items),
+            "total_first": first.get("total_first", len(base))}
+
+
+def draft_job(review: Path) -> int | None:
+    """Номер задания, которому принадлежит черновик: первой версии — или карточки.
+
+    Черновик, взятый с сервера, принадлежит СВОЕМУ заданию, и назад он кладётся
+    под ним же: у карточки, снятой позже, задание бывает уже новее, и под его
+    номером сервер счёл бы положение новым разбором.
+    """
+    first = first_version(review) or {}
+    return first.get("job_id") or (meeting_card(review) or {}).get("job_id")
+
+
+def signalled_window(review: Path, job_id) -> bool:
+    """Черновик кладёт окно СИГНАЛА этого задания — по записи подготовки разбора.
+
+    Запись (`avtomat.RUN_MARK`) пишет `avtomat.py run`, подготовив разбор, и в
+    ней сказано, не вечерний ли это проход (#518). Записи нет — на компьютере
+    или после перезапуска машины с пустым диском — «не окно сигнала»: письмо
+    сервера уйдёт без ссылки, а не со ссылкой на окно чужого запуска.
+    """
+    mark = read_json(review / avtomat.RUN_MARK)
+    return (isinstance(mark, dict) and mark.get("job_id") == job_id
+            and mark.get("signalled") is True)
+
+
+def put_draft(review: Path, env: dict, body: dict) -> dict:
+    """Положить черновик на сервер. Ответ сервера — или отказ клиента.
+
+    Номер встречи — из КАРТОЧКИ (`Встреча.json`), номер задания — `draft_job`:
+    положить черновик вправе исполнитель задания, и сервер сверяет задание со
+    встречей. Первая ПОЛОЖЕННАЯ версия ложится в `package.first.json`: не легла
+    на сервер — первой она не стала, и доля правок её не считает.
+    """
+    card = meeting_card(review) or {}
+    job_id = draft_job(review)
+    if not card.get("id") or not job_id:
+        raise client.Usage(
+            "У карточки встречи нет задания автомата — черновик разбора класть не к чему",
+            [f"карточка: {review / MEETING}",
+             "черновик на сервере бывает только у разбора, поставленного автомату"])
+    items = bare_items(body)
+    answer = client.review_draft_put(card["id"], {"job_id": job_id, "items": items,
+                                                  "signalled": signalled_window(review, job_id),
+                                                  **draft_numbers(review, body)},
+                                     url=client.base_url(env), key=client.access_key(env))
+    client.check_meetings(answer)
+    if first_version(review) is None:
+        write_first(review, items, job_id=job_id, from_server=False)
+    return answer
+
+
+def restore_draft(review: Path, env: dict) -> str | None:
+    """Черновик разбора с сервера — в папку, если своего нет. Слово человеку или None.
+
+    СПРАШИВАЕТ ТОЛЬКО ТАМ, ГДЕ ЕСТЬ ЧТО СПРОСИТЬ: разбор встречи поставлен
+    заданию из карточки (`review_ordered`), а ни черновика, ни подтверждённого
+    пакета в папке нет. Свой черновик сильнее серверного: в нём цитаты и
+    уточнения, которых сервер не хранит.
+
+    ДОЛЯ ПРАВОК (спека #506): первая версия — та, что скрипт положил первой, а
+    восстановленный черновик считается первой версией ДЛЯ КОМПЬЮТЕРА. Поэтому на
+    компьютере правки считаются от него с нуля, а в окне после перезапуска
+    машины — прибавляются к числам, которые окно успело положить: иначе каждый
+    перезапуск занижал бы долю правок, по которой решается автоотправка (Р13).
+    Цитат в черновике нет — вернуть их может только агент из транскрипта; вида
+    встречи сервер не хранит — его агент впишет сам.
+
+    СЕРВЕР НЕ ОТВЕТИЛ — ЭТО НЕ ОТКАЗ `status`: разбор идёт как без черновика, а
+    причина названа словами. «Где мы?» не вправе падать из-за сети.
+    """
+    card = meeting_card(review)
+    if not review_ordered(card) or (review / DRAFT).is_file() or (review / PACKAGE).is_file():
+        return None
+    try:
+        answer = client.review_draft(card["id"], url=client.base_url(env),
+                                     key=client.access_key(env))
+        client.check_meetings(answer)
+    except client.ClientError as beda:
+        return (f"черновик разбора на сервере не спросить — идём без него: "
+                f"{client.redact(beda.message, env.get(client.KEY_ENV))}")
+    server_draft = answer.get("draft")
+    if not isinstance(server_draft, dict) or not isinstance(server_draft.get("items"), list):
+        return None
+    items = server_draft["items"]
+    restored = {"format": PACKAGE_FORMAT, "version": client.PACKAGE_FORMAT_VERSION,
+                "meeting": {"date": card["date"]} if card.get("date") else {},
+                "items": items}
+    (review / DRAFT).write_text(json.dumps(restored, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+    counted = {}
+    if strazh.in_cloud() and isinstance(server_draft.get("total_first"), int):
+        counted = {"edits": int(server_draft.get("edits") or 0),
+                   "total_first": server_draft["total_first"]}
+    write_first(review, items, job_id=server_draft.get("job_id"), from_server=True, **counted)
+    return (f"черновик разбора взят с сервера: версия {server_draft.get('version')}, "
+            f"пунктов {len(items)} — цитат в нём нет")
+
+
+# ---------------------------------------------------------------------------
 # Команды
 # ---------------------------------------------------------------------------
 def cmd_status(args, env: dict) -> int:
     review = folder_for(args)
+    # Черновик сервера — ДО подсчёта состояния (#514): восстановленный черновик и
+    # есть сделанный шаг «извлечь», и следующий шаг обязан это знать.
+    restored = restore_draft(review, env)
     st = state(review, env, meeting_date(getattr(args, "date", None)))
     key, what = next_step(st)
     st["next"] = key
     st["next_hint"] = what
+    st["server_draft"] = restored
     if args.json:
         print(json.dumps(st, ensure_ascii=False, indent=2))
         return client.EXIT_OK
 
     done = {True: "✔", False: "·"}
     print(f"Разбор {st['date']} · {st['folder']}")
+    if restored:
+        print(f"  ! {restored}")
     card = st["meeting"]
     if card:
         print(f"  ✔ встреча       #{card['id']} «{card['title']}» {card['start_time'] or ''} · "
@@ -804,7 +1227,8 @@ def cmd_status(args, env: dict) -> int:
     print(f"  {done[st['tasks']]} выгрузка      "
           f"{'снимок не сегодняшний — нужен свежий' if st['tasks_stale'] else TASKS}")
     print(f"  {done[st['draft'] or st['package']]} разбор        "
-          f"{PACKAGE if st['package'] else DRAFT}")
+          f"{PACKAGE if st['package'] else DRAFT}"
+          f"{'  с сервера, без цитат' if st['draft_from_server'] and not st['package'] else ''}")
     print(f"  {done[st['package']]} «запиши»      {PACKAGE}")
     print(f"  {done[st['sent']]} отправлено")
     print(f"  {'—' if st['publish_off'] else done[st['published']]} итог в группе"
@@ -1173,13 +1597,35 @@ def cmd_preview(args, env: dict) -> int:
     Порядок именно такой: после правок руководителя агент переписывает черновик,
     и превью обязано показать новое. Показав вместо него уже подтверждённый
     пакет, оно рассказывало бы человеку о том, что он правил минуту назад.
+
+    В ОКНЕ РАЗБОРА ПРЕВЬЮ ЧЕРНОВИКА КЛАДЁТ ЕГО НА СЕРВЕР (#514) — тем же шагом,
+    а не отдельной командой: превью модель зовёт после каждой правки и так, а
+    шаг, который нельзя забыть, надёжнее шага, который надо помнить. Кладётся
+    черновик встречи, разбор которой поставлен заданию из карточки
+    (`review_ordered`): ручной разбор в облачной сессии черновика на сервере не
+    имеет. Не лёг — это ошибка с кодом сервера (2 или 3), а не предупреждение:
+    без черновика человек не узнает о разборе вовсе. Расхождения со снимком
+    по-прежнему дают код 1 — после положения. На компьютере превью ничего не
+    кладёт — разбор там ведёт сам человек.
+
+    СВЕРКА — СО СВЕЖИМ СНИМКОМ (`fresh_snapshot`, #518): на компьютере — со
+    снятым сегодня, в окне — с выгрузкой, сделанной этим же превью: окно живёт
+    сутками, и прежний снимок промолчал бы о задаче, закрытой после него.
+
+    ССЫЛКУ НА ОКНО В ПИСЬМЕ «РАЗБОР ГОТОВ» СЕРВЕР ДАЁТ ТОЛЬКО ОКНУ СИГНАЛА
+    (`signalled_window`): у вечернего прохода её нет, и слова превью говорят
+    модели ровно то, что придёт человеку, — иначе она пообещала бы ссылку.
     """
     review = folder_for(args)
     source = review / (DRAFT if (review / DRAFT).is_file() else PACKAGE)
     package = read_json(source)
     if package is None:
         raise client.Usage(f"Разбора нет: положи его в {review / DRAFT} и покажи превью снова")
-    snapshot = read_json(review / TASKS)
+    snapshot, code = fresh_snapshot(review)
+    if code != client.EXIT_OK:
+        print("Свежую выгрузку задач не взять — сверки нет, показывать разбор нельзя. "
+              "Покажи превью ещё раз.", file=sys.stderr)
+        return code
     if snapshot is None:
         raise client.Usage(f"Нет снимка задач ({review / TASKS}) — сверять пункты не с чем. "
                            f"Сделай выгрузку: meeting.py tasks")
@@ -1188,20 +1634,51 @@ def cmd_preview(args, env: dict) -> int:
     lines, problems = preview_lines(package, snapshot)
     print(f"Разбор: {meeting.get('kind', 'встреча')} {meeting.get('date', '')} · "
           f"пунктов {len(package.get('items') or [])} · источник {source.name}")
+    # Сравнивается ПАКЕТ, а не байты: `confirm` срезает список уточнений и ставит
+    # номер встречи (`package_of`), и черновик от этого с подтверждённым не
+    # расходится ничем.
     if source.name == DRAFT and (review / PACKAGE).is_file() and \
-            digest(review / DRAFT) != digest(review / PACKAGE):
+            package_of(review, package) != read_json(review / PACKAGE):
         print("Черновик расходится с подтверждённым пакетом — на него нужно новое «запиши».")
     print("\n".join(lines))
+    empty = no_tasks_words(review, package) if source.name == DRAFT else None
     if problems:
         print("Расхождения со снимком — пакет в таком виде сервер отвергнет:")
         for line in problems:
             print(f"  · {line}")
-        return client.EXIT_USAGE
-    print("Люди и задачи сошлись со снимком. Формат и права судит сервер при отправке.")
-    return client.EXIT_OK
+    elif empty:
+        print(empty)
+    else:
+        print("Люди и задачи сошлись со снимком. Формат и права судит сервер при отправке.")
+    found = client.EXIT_USAGE if problems else client.EXIT_OK
+    # КЛАДЁТСЯ И ЧЕРНОВИК С РАСХОЖДЕНИЯМИ (спека #506: «превью кладёт черновик»,
+    # без условия): расхождения чинятся словами человека в окне, а черновик, так
+    # и не положенный, через два часа закрыл бы разбор «не вышел» — и с ним
+    # готовый разбор в окне. Не кладётся — после отправки пакета: применение
+    # черновик уже погасило, и положение сервер отверг бы.
+    if (source.name != DRAFT or not strazh.in_cloud()
+            or not review_ordered(meeting_card(review)) or sent_package(review)):
+        return found
+    try:
+        answer = put_draft(review, env, package)
+    except client.ClientError as beda:
+        print("Черновик разбора на сервер не положен — без него человек не узнает о "
+              "разборе. Покажи превью ещё раз; не ложится — скажи это в показе.",
+              file=sys.stderr)
+        return client.fail(beda, env.get(client.KEY_ENV))
+    if answer.get("outcome") == "created":
+        print(f"Черновик разбора на сервере (версия {answer.get('draft_version')}): "
+              + (WINDOW_LETTER if signalled_window(review, draft_job(review))
+                 else SWEEP_LETTER))
+    else:
+        print(f"Черновик разбора на сервере обновлён: версия {answer.get('draft_version')}.")
+    return found
 
 
 def cmd_confirm(args, env: dict) -> int:
+    # Страж слова — ПЕРВЫМ, до слова аргументом: в облаке слово аргументом
+    # передаёт модель, и сказал ли его человек, знает только журнал окна.
+    strazh.require_word_in_cloud()
     review = folder_for(args)
     draft, package = review / DRAFT, review / PACKAGE
     client.confirmed_by(args.word)
@@ -1227,7 +1704,21 @@ def cmd_confirm(args, env: dict) -> int:
             ["исправь `version` в черновике разбора и подтверди заново",
              "если черновик писался по инструкции — устарела она, а не разбор: "
              "скажи владельцу системы"])
-    package.write_bytes(draft.read_bytes())
+    empty = no_tasks_words(review, body)
+    if empty:
+        raise client.Usage(empty)
+    # Пакет — черновик без списка уточнений и с номером встречи (`package_of`).
+    # Срезать и ставить нечего — пакет, как всегда, байт в байт черновик.
+    confirmed = package_of(review, body)
+    if confirmed != body:
+        package.write_text(json.dumps(confirmed, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+    else:
+        package.write_bytes(draft.read_bytes())
+    # ДОЛЯ ПРАВОК (Р13) — относительно первой версии, если она была: у разбора,
+    # начатого на компьютере с нуля, её нет, и считать нечего.
+    first = first_version(review)
+    numbers = draft_numbers(review, body) if first is not None else {}
     # Отпечаток и слово пишутся ПОСЛЕ пакета: оборвись запись посередине, лучше
     # остаться с неподтверждённым пакетом, чем с подтверждением на пустое место.
     #
@@ -1239,8 +1730,24 @@ def cmd_confirm(args, env: dict) -> int:
         "team": snapshot_team(review),
         "word": args.word.strip(),
         "at": datetime.now().isoformat(timespec="seconds"),
+        **{name: numbers[name] for name in ("edits", "total_first") if name in numbers},
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f'Слово сказано («{args.word.strip()}») — разбор подтверждён: {package}')
+    if numbers:
+        print(f"Правок относительно первой версии: {numbers['edits']} "
+              f"из {numbers['total_first']} пунктов.")
+    # ПОСЛЕДНЯЯ ВЕРСИЯ С ЧИСЛАМИ — НА СЕРВЕР, перед отправкой: в облаке всегда, на
+    # компьютере — только черновик, пришедший с сервера (свой ручной разбор
+    # компьютер не кладёт). Не легла — это предупреждение, а не отказ: слово уже
+    # сказано, и отнять его из-за числа правок значило бы просить «запиши» снова.
+    if first is not None and (strazh.in_cloud() or first.get("from_server")) \
+            and draft_job(review):
+        try:
+            put_draft(review, env, body)
+        except client.ClientError as beda:
+            print("Внимание: последняя версия черновика с числом правок на сервер не "
+                  "легла — пакет подтверждён, отправке это не мешает.", file=sys.stderr)
+            client.fail(beda, env.get(client.KEY_ENV))
     print("Дальше: meeting.py send --team <отдел>")
     return client.EXIT_OK
 
@@ -1254,6 +1761,29 @@ def _same_receipt_team(recorded, selector: str) -> bool:
     сервера — тот узнаёт пакет по отпечатку и второй раз задачи не заводит.
     """
     return isinstance(recorded, str) and recorded.strip().lower() == selector.strip().lower()
+
+
+def server_draft_job(review: Path) -> int | None:
+    """Номер задания, если пакет собирается из ЧЕРНОВИКА С СЕРВЕРА, — иначе None.
+
+    Черновик с сервера — в окне разбора и тот, что компьютер взял с сервера
+    (`first_version`, `from_server`), у встречи, чей разбор поставлен заданию из
+    карточки (`review_ordered`). Ручной разбор на компьютере серверного черновика
+    не имеет, и номера задания его пакет не несёт.
+
+    ЖИВ ЛИ ЧЕРНОВИК, СУДИТ СЕРВЕР, А НЕ ЭТОТ СКРИПТ (ревью #518, этап 2): номер
+    уезжает в пакете (`package_of`), и применение отвергает пакет закрытого
+    разбора у любой двери — `meeting.py send`, `send_package.py --package`, CLI
+    сервера. Прежняя проверка стояла здесь, у одной двери, и вторая принимала
+    тот же пакет. Повтор уже применённого пакета сервер узнаёт по отпечатку
+    раньше этого суда, и потерянный ответ досдаётся, а не отвергается.
+    """
+    first = first_version(review) or {}
+    if not review_ordered(meeting_card(review)):
+        return None
+    if not (strazh.in_cloud() or first.get("from_server")):
+        return None
+    return draft_job(review)
 
 
 def write_receipt(review: Path, package: Path, team: str, code: int) -> None:
@@ -1272,6 +1802,9 @@ def cmd_send(args, env: dict) -> int:
     Сервер и сам узнал бы повтор по отпечатку, но идти к нему незачем: расписка
     уже знает исход, а лишний вызов на неполном итоге читался бы как «досдал».
     """
+    # Страж слова в облаке — раньше отдела и отпечатка: подтверждённый пакет
+    # на диске не значит, что человек сказал «запиши» перед ЭТОЙ отправкой.
+    strazh.require_word_in_cloud()
     review = folder_for(args)
     # Отдел спрашивается ДО всего остального: забытый флаг не должен оставлять
     # ни расписки, ни половины работы.
@@ -1308,8 +1841,11 @@ def cmd_send(args, env: dict) -> int:
     # задачи или человек, которого в компании нет, уехали бы на сервер и вернулись
     # отказом всего пакета. Причины называются здесь теми же словами, что скажет
     # сервер. Снимка нет — сверять нечем, и это не повод не отправлять: судит
-    # всё равно сервер.
-    snapshot = read_json(review / TASKS)
+    # всё равно сервер. Устаревший снимок делается заново (`fresh_snapshot`).
+    snapshot, fetched = fresh_snapshot(review)
+    if fetched != client.EXIT_OK:
+        print("Свежую выгрузку задач не взять — без сверки не отправляю.", file=sys.stderr)
+        return fetched
     if snapshot is not None:
         _, problems = preview_lines(read_json(package) or {}, snapshot)
         if problems:
@@ -1365,10 +1901,26 @@ def cmd_publish(args, env: dict) -> int:
     return code
 
 
+def cmd_strazh(args, env: dict) -> int:
+    """Самопроверка стража слова: вердикт по журналу окна, код 0 или 1.
+
+    Журнал ищется ТАК ЖЕ, как его ищет проверка внутри `confirm` и `send`, — или
+    берётся названный. Её позовёт пробный запуск мастера автомата (#516): в
+    облаке сообщения человека в окне ещё нет, и ждут там запрет — пропуск значил
+    бы, что страж засчитал за человека инструкцию рутины.
+    """
+    path = Path(args.journal) if args.journal else strazh.find_journal()
+    verdict = strazh.judge(path)
+    print(f"Журнал: {path}" if path else "Журнал разговора на этой машине не найден.")
+    print(f"{'Пропуск' if verdict.allow else 'Запрет'}: {verdict.why}")
+    return client.EXIT_OK if verdict.allow else client.EXIT_USAGE
+
+
 COMMANDS = {
     "status": cmd_status, "meetings": cmd_meetings, "find": cmd_find,
     "transcribe": cmd_transcribe, "tasks": cmd_tasks, "preview": cmd_preview,
     "confirm": cmd_confirm, "send": cmd_send, "publish": cmd_publish,
+    "strazh": cmd_strazh,
 }
 
 
@@ -1419,6 +1971,10 @@ def _parser() -> argparse.ArgumentParser:
 
     publish = common("publish", "досдать итог планёрки в чат отдела")
     publish.add_argument("--team", help="отдел разбора: номер или имя (обязателен)")
+
+    # Без `common`: даты и папки разбора у стража нет — он судит окно, а не встречу.
+    guard = subs.add_parser("strazh", help="самопроверка стража слова по журналу окна")
+    guard.add_argument("--journal", help="журнал разговора (без него — самый свежий на машине)")
     return parser
 
 

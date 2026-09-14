@@ -140,6 +140,17 @@ TRANSCRIPT_OUTCOMES = (TRANSCRIPT_DONE, TRANSCRIPT_FAILED, TRANSCRIPT_NO_RECORDI
 # сервер отверг бы отчёт незнакомым полем после часа работы автомата.
 MY_MEETINGS_FIELD = "my_meetings_ready"
 
+# СЛОВО ОБ УМЕНИИ «РАЗБОР» (#509, #514) — рядом со словом о готовности и по той
+# же причине: способность сообщает сам пакет, при любом исходе отчёта, и тем же
+# именем, что у сервера (`core.REVIEWS_FIELD`). Этот пакет разбор умеет — слово
+# всегда «да».
+REVIEWS_FIELD = "reviews"
+
+# Слова пакета о себе — ЕДИНСТВЕННЫЕ поля отчёта, которые можно снять и
+# повторить без них (см. `transcripts`): сервер, ещё не знающий слова, отверг бы
+# весь отчёт, а сам отчёт важнее любого слова о себе.
+SELF_WORDS = (MY_MEETINGS_FIELD, REVIEWS_FIELD)
+
 # Имена файлов папки разбора, которые нужны ОБОИМ клиентам. Остальные знает одна
 # механика разбора (`meeting.py`); эти два вынесены сюда потому, что гейт
 # «запиши» обязан держать и у прямого клиента: имя файла подтверждения —
@@ -892,45 +903,93 @@ def transcripts(meeting_id: int, report: dict, *, url: str, key: str) -> dict:
         if value is None:
             continue
         body[name] = value[:TRANSCRIPT_REPORT_LINE_MAX] if isinstance(value, str) else value
-    try:
-        return _post_report(meeting_id, body, url=url, key=key)
-    except Refused as refusal:
-        # СЛОВО О ГОТОВНОСТИ — ЕДИНСТВЕННОЕ ПОЛЕ, КОТОРОЕ МОЖНО СНЯТЬ И ПОВТОРИТЬ.
-        # Пакет и сервер живут разными репозиториями, а облачная рутина клонирует
-        # пакет заново каждый запуск: выкати мы пакет раньше сервера — и сервер,
-        # ещё не знающий этого поля, отверг бы ВЕСЬ отчёт, то есть текст уже лежал
-        # бы в Библиотеке, а задание навсегда осталось бы «в полёте». Правило
-        # контура прежнее и остаётся верным: порядок выкатки не значим ни в одну
-        # сторону. Снимается ровно это поле и ровно на один повтор — остальные
-        # отказы 400 так же остаются отказами.
-        if refusal.status != 400 or refusal.field != MY_MEETINGS_FIELD:
-            raise
-        if MY_MEETINGS_FIELD not in body:
-            raise
-        body.pop(MY_MEETINGS_FIELD)
-        return _post_report(meeting_id, body, url=url, key=key)
+    return _without_unknown_self_words(
+        body, lambda sent: _post_report(meeting_id, sent, url=url, key=key))
+
+
+def _without_unknown_self_words(body: dict, send) -> dict:
+    """Отправить тело; слово о себе, которого сервер не знает, — снять и повторить.
+
+    СЛОВА ПАКЕТА О СЕБЕ — ЕДИНСТВЕННЫЕ ПОЛЯ, КОТОРЫЕ МОЖНО СНЯТЬ И ПОВТОРИТЬ
+    (`SELF_WORDS`: готовность «Моих встреч», умение «разбор»). Пакет и сервер
+    живут разными репозиториями, а облачная рутина клонирует пакет заново каждый
+    запуск: выкати мы пакет раньше сервера — и сервер, ещё не знающий слова,
+    отверг бы ВЕСЬ отчёт, то есть текст уже лежал бы в Библиотеке, а задание
+    навсегда осталось бы «в полёте». Правило контура прежнее и остаётся верным:
+    порядок выкатки не значим ни в одну сторону.
+
+    Каждое слово снимается РОВНО ОДИН РАЗ и только названное отказом: сервер
+    старше обоих слов называет их по одному, и второе снимается своим повтором.
+    Остальные отказы 400 остаются отказами — повторяй клиент любую, он молча слал
+    бы тело, которое сервер уже назвал неверным.
+    """
+    while True:
+        try:
+            return send(body)
+        except Refused as refusal:
+            if refusal.status != 400 or refusal.field not in SELF_WORDS:
+                raise
+            if refusal.field not in body:
+                raise
+            body = {name: value for name, value in body.items() if name != refusal.field}
 
 
 def _post_report(meeting_id: int, body: dict, *, url: str, key: str) -> dict:
-    """Отправить готовое тело отчёта — ШОВ к `call` для обеих попыток."""
+    """Отправить готовое тело отчёта — ШОВ к `call` для каждой попытки."""
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     return call("POST", f"/api/pc/transcripts/{int(meeting_id)}", url=url, key=key,
                 timeout=TIMEOUT_READ_SEC, body=raw)
 
 
 def my_meetings(ready: bool, *, url: str, key: str) -> dict:
-    """Самоотчёт автомата о готовности «Моих встреч» — БЕЗ ЗАДАНИЯ (#475, Р13).
+    """Самоотчёт автомата о себе — БЕЗ ЗАДАНИЯ (#475, Р13; умение «разбор» — #514).
 
-    Вторая дверь того же слова, и нужна она потому, что первый раз о готовности
-    говорит пробный запуск мастера «подключи автомат»: заданий в тот момент нет
+    Вторая дверь тех же слов, и нужна она потому, что первый раз о себе пакет
+    говорит пробным запуском мастера «подключи автомат»: заданий в тот момент нет
     ни одного, и сказать иначе нечем.
 
-    ТЕЛО — РОВНО ОДНО ПОЛЕ. Сервер отвергает незнакомый ключ телом целиком и
-    называет его по имени, а номер человека сюда не пишется вовсе: адресат слова
-    — хозяин ключа, и подставить другого нечем.
+    ТЕЛО — ТОЛЬКО СЛОВА О СЕБЕ: готовность «Моих встреч» и умение «разбор». Сервер
+    отвергает незнакомый ключ телом целиком и называет его по имени (у сервера
+    старее #509 это умение — и оно снимается, как в отчёте), а номер человека сюда
+    не пишется вовсе: адресат слова — хозяин ключа, и подставить другого нечем.
     """
-    raw = json.dumps({MY_MEETINGS_FIELD: bool(ready)}, ensure_ascii=False).encode("utf-8")
-    return call("POST", "/api/pc/my-meetings", url=url, key=key,
+    def send(body: dict) -> dict:
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return call("POST", "/api/pc/my-meetings", url=url, key=key,
+                    timeout=TIMEOUT_READ_SEC, body=raw)
+
+    return _without_unknown_self_words({MY_MEETINGS_FIELD: bool(ready),
+                                        REVIEWS_FIELD: True}, send)
+
+
+# ---------------------------------------------------------------------------
+# Черновик разбора (#511, зовут `meeting.py` и `avtomat.py`, #514)
+#
+# Три двери рядом с отчётом о расшифровке и по тому же правилу: ключ, таймаут и
+# смысл кодов возврата — общие. Формат ответа сверяет вызывающий
+# (`check_meetings`): шапка у этих ручек та же, что у ручек автомата.
+#
+# ТЕКСТА ВСТРЕЧИ В ТЕЛАХ НЕТ (инвариант 22): пункты черновика уезжают без цитат,
+# уточнения — одним числом, причина «не вышло» — словом. Собирают тела
+# вызывающие; судья тела — сервер, он отвергает незнакомое поимённо.
+# ---------------------------------------------------------------------------
+def review_draft_put(meeting_id: int, body: dict, *, url: str, key: str) -> dict:
+    """Положить черновик разбора встречи: первый раз создаёт, дальше обновляет."""
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    return call("PUT", f"/api/pc/reviews/{int(meeting_id)}/draft", url=url, key=key,
+                timeout=TIMEOUT_READ_SEC, body=raw)
+
+
+def review_draft(meeting_id: int, *, url: str, key: str) -> dict:
+    """Живой черновик разбора встречи — ключ `draft`, `null` без черновика."""
+    return call("GET", f"/api/pc/reviews/{int(meeting_id)}/draft", url=url, key=key,
+                timeout=TIMEOUT_READ_SEC)
+
+
+def review_failed(meeting_id: int, body: dict, *, url: str, key: str) -> dict:
+    """Отчёт «разбор не вышел»: номер задания и слово причины."""
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    return call("POST", f"/api/pc/reviews/{int(meeting_id)}/failed", url=url, key=key,
                 timeout=TIMEOUT_READ_SEC, body=raw)
 
 

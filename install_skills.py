@@ -16,6 +16,13 @@
 поэтому шапка общей инструкции переносится в указатель дословно, и второго места,
 где описан скилл, не заводится.
 
+СТРАЖ СЛОВА ЕДЕТ ВМЕСТЕ СО СКИЛЛАМИ (#508). Хук Claude Code `PreToolUse`
+(`strazh.py`) судит по журналу разговора, сказал ли «запиши» сам человек, прежде
+чем пропустить `meeting.py confirm` и `send`. Ложится туда же, куда скиллы: в
+`.claude/settings.json` рабочей копии или, с `--home`, домашней папки — чужие
+ключи и чужие хуки файла остаются как были, повтор себя не дублирует. У Codex
+хуков и журнала Claude нет: там держит `confirm --word`.
+
     python install_skills.py            подключить в этой рабочей копии
     python install_skills.py --check    что подключено и куда
     python install_skills.py --home     подключить глобально (все проекты)
@@ -32,6 +39,7 @@ import sys
 from pathlib import Path
 
 import oblako_client as client
+import strazh
 
 SCRIPT = Path(__file__).resolve()
 SKILLS_DIR = SCRIPT.parent / "Скиллы"
@@ -119,8 +127,26 @@ def pointers(root: Path):
             yield agent, target, body, same
 
 
+def guard(root: Path) -> tuple:
+    """Хук стража слова рядом со скиллами: (файл настроек Claude Code, состояние).
+
+    Состояние — слово `strazh.hook_state` («same», «stale», «missing»). Отдельно
+    ради проверки установки по той же причине, что `pointers`: второй судья
+    «подключён ли хук» однажды разошёлся бы с тем, кто его ставит.
+    """
+    path = strazh.settings_file(root)
+    return path, strazh.hook_state(path)
+
+
+GUARD = "Страж слова"
+GUARD_MARKS = {"same": "✔", "stale": "устарел", "missing": "нет"}
+
+
 def install(root: Path, dry: bool) -> int:
-    """Разложить указатели по папкам клиентов. `dry` — только показать состояние."""
+    """Разложить указатели по папкам клиентов и поставить стража.
+
+    `dry` — только показать состояние. Возвращает число неподключённого.
+    """
     stale = 0
     for agent, target, body, same in pointers(root):
         if dry:
@@ -131,6 +157,14 @@ def install(root: Path, dry: bool) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
         print(f"  {agent:12} {'уже подключён' if same else 'подключён'}: {target}")
+    if dry:
+        settings, state = guard(root)
+        stale += 0 if state == "same" else 1
+        print(f"  {GUARD:12} {GUARD_MARKS[state]:8} {settings}")
+        return stale
+    settings = strazh.settings_file(root)
+    done = strazh.install_hook(settings)
+    print(f"  {GUARD:12} {'уже подключён' if done == 'same' else 'подключён'}: {settings}")
     return stale
 
 

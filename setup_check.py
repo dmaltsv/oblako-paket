@@ -17,6 +17,8 @@
                     говорящих придут через полчаса или не придут вовсе
     папки           `Разборы` и `Аудио` есть (нет — заводим тут же)
     команды агенту  указатели разложены и не устарели
+    страж слова     хук Claude Code рядом с командами: без слова человека
+                    `confirm` и `send` не проходят
     Библиотека      клоны на месте, `origin` наш, имя автора задано
     автомат         подключён ли, и на месте ли здесь всё, что ему отдали
     сервер          живой ответ по ключу: адрес, ключ, права и состав разом
@@ -58,6 +60,7 @@ import fetch_tasks
 import install_skills
 import meeting
 import oblako_client as client
+import strazh
 import zoom_pull
 
 SCRIPT = Path(__file__).resolve()
@@ -249,6 +252,26 @@ def check_skills(report: Report) -> None:
                    "python install_skills.py, потом перезапусти клиента")
         return
     report.ok("Команды агенту", ", ".join(names))
+
+
+def check_guard(report: Report) -> None:
+    """Хук стража слова стоит рядом с командами агенту и ведёт в эту папку.
+
+    Спрашивает ТО ЖЕ место и того же судью, что ставит хук
+    (`install_skills.guard`): свой счётчик у проверки однажды разошёлся бы с
+    установкой и хвалил бы неподключённое.
+    """
+    try:
+        settings, state = install_skills.guard(install_skills.targets(home=False))
+    except (client.ClientError, OSError) as error:
+        report.bad("Страж слова", getattr(error, "message", str(error)),
+                   "python install_skills.py")
+        return
+    if state != "same":
+        report.bad("Страж слова", f"хук {strazh.HOOK_STATE_WORDS[state]}: {settings}",
+                   "python install_skills.py, потом перезапусти клиента")
+        return
+    report.ok("Страж слова", f"хук Claude Code в {settings}")
 
 
 def check_recording(report: Report, env: dict) -> None:
@@ -581,6 +604,7 @@ def main(argv=None) -> int:
         access = check_env(report, env)
         check_folders(report)
         check_skills(report)
+        check_guard(report)
         check_recording(report, env)
         check_library(report, env, args.offline)
         check_automaton(report, env)
