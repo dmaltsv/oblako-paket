@@ -10,12 +10,16 @@
 не значат ничего: сервер подставляет автора сам (вторая половина инварианта 9).
 Называть себя ключом командной строки поэтому нечем и незачем.
 
-ОТДЕЛ (`--team`) ОБЯЗАТЕЛЕН: по составу названного отдела судятся пункты пакета,
-и в его чат уходит итог. Угадывать отдел система права не имеет — руководитель
-вправе вести несколько (решение 3.5.21).
+ОТДЕЛ (`--team`) НАЗЫВАЕТСЯ ВСЕГДА: по составу названного отдела судятся пункты
+пакета, и в его чат уходит итог. Угадывать отдел система права не имеет —
+руководитель вправе вести несколько (решение 3.5.21). Разбор встречи без отдела —
+совета, 1:1, разовой (#522) — называется флагом `--no-team`: круг закрытия и
+правки тогда — люди автора, итога в группу нет, код возврата 5. Планёрку отдела
+без отдела сервер не принимает.
 
 ГЕЙТ «ЗАПИШИ» ДЕРЖИТ И ЗДЕСЬ. Рядом с файлом пакета обязано лежать
-`Подтверждение.json` с тем же отпечатком и тем же отделом — иначе отправки нет.
+`Подтверждение.json` с тем же отпечатком и тем же отделом (или «без отдела»
+у `--no-team`) — иначе отправки нет.
 Дверей к серверу две (эта и `meeting.py send`), и гейт, стоящий у одной,
 держался бы честным словом инструкции. Проверку ведёт `oblako_client.
 require_confirmation` — она одна на обоих клиентов.
@@ -30,6 +34,8 @@ require_confirmation` — она одна на обоих клиентов.
 
 Режимы:
   --package ФАЙЛ   сдать разбор: `POST /api/pc/meeting-package?team=…`
+  --no-team        сдать разбор встречи без отдела: `…?no_team=1`. Итога в
+                   группу нет; подтверждение должно быть без отдела
   --no-publish     сдать разбор БЕЗ публикации итога: задачи лягут в списки,
                    уведомления уйдут, поста в группу не будет. Так сдаётся
                    разбор отдела, у которого группового чата нет
@@ -53,7 +59,8 @@ require_confirmation` — она одна на обоих клиентов.
 
 Примеры:
   python send_package.py --package "Разборы/13.07.26/package.json" --team Продажи
-  python send_package.py --package "…/package.json" --team "Совет управляющих" --no-publish
+  python send_package.py --package "…/package.json" --team "Розница" --no-publish
+  python send_package.py --package "Разборы/15.09.26/package.json" --no-team
   python send_package.py --package "Разборы/13.07.26/package.json" --team 1 --dry-run
   python send_package.py --publish-only --team Продажи
   python send_package.py --package "…/package.json" --team 1 --local --actor 1 --publish
@@ -82,9 +89,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--package", help="путь к package.json")
     parser.add_argument("--publish-only", action="store_true", dest="publish_only",
                         help="только опубликовать итог последней планёрки отдела")
-    # Отдел обязателен в обоих режимах и проверяется здесь, а не на сервере:
-    # сказать об этом до отправки честнее, чем после.
-    parser.add_argument("--team", help="отдел разбора: номер или имя (обязателен)")
+    # Отдел называется в обоих режимах и проверяется здесь, а не на сервере:
+    # сказать об этом до отправки честнее, чем после. У сдачи вместо него бывает
+    # `--no-team` (#522), у досдачи — никогда.
+    parser.add_argument("--team", help="отдел разбора: номер или имя "
+                                       "(или --no-team у встречи без отдела)")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                         help="показать, что уедет, и ничего не отправлять")
     # Пара называет ОЖИДАЕМУЮ встречу у досдачи: сервер иначе публикует последний
@@ -95,6 +104,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="досдача: вид встречи из пакета")
     parser.add_argument("--no-publish", action="store_true", dest="no_publish",
                         help="сдать разбор без публикации итога (у отдела нет группового чата)")
+    # «Без отдела» (#522) — слово, а не молчание: без `--team` и без этого флага
+    # отдел остаётся не названным, и сдача отказывает до сети.
+    parser.add_argument("--no-team", action="store_true", dest="no_team",
+                        help="разбор встречи без отдела: итога в группу нет")
     parser.add_argument("--publish", action="store_true",
                         help="локальный режим: опубликовать итог (по ключу он публикуется всегда)")
     parser.add_argument("--local", action="store_true",
@@ -121,7 +134,12 @@ def check_args(args) -> None:
     if args.no_publish and args.publish:
         raise client.Usage("--no-publish и --publish вместе не работают: "
                            "выбери одно")
-    client.team(args.team)
+    # У встречи без отдела итога в группе нет (#522): просьба его опубликовать
+    # или досдать — противоречие, а не повод решить за человека.
+    if args.no_team and (args.publish_only or args.publish):
+        raise client.Usage("--no-team с публикацией не работает: у встречи без отдела "
+                           "итога в группе нет — публиковать и досдавать нечего")
+    client.team(args.team, no_team=args.no_team)
 
 
 def load_package(path: str) -> tuple[bytes, dict]:
@@ -150,7 +168,7 @@ def load_package(path: str) -> tuple[bytes, dict]:
     return raw, package
 
 
-def preview(package: dict, team: str, where: str, no_publish: bool = False) -> str:
+def preview(package: dict, team: str | None, where: str, no_publish: bool = False) -> str:
     """Что уедет — словами, без отправки. Ответ на `--dry-run`.
 
     ПРЕВЬЮ МЕСТНОЕ И НИЧЕГО НЕ ПРОВЕРЯЕТ. Прежний `-DryRun` звал
@@ -168,10 +186,14 @@ def preview(package: dict, team: str, where: str, no_publish: bool = False) -> s
     parts = ", ".join(f"{op}: {count}" for op, count in sorted(by_op.items())) or "пусто"
     # Публикация — часть того, «что уедет»: молчание о ней превратило бы
     # превью в полуправду ровно там, где человек её и проверяет.
-    publication = ("Итог в группу публиковать не будем (--no-publish)."
-                   if no_publish else "Итог уйдёт в групповой чат отдела.")
+    if team is None:
+        publication = "Итога в группу не будет: у встречи нет отдела (--no-team)."
+    else:
+        publication = ("Итог в группу публиковать не будем (--no-publish)."
+                       if no_publish else "Итог уйдёт в групповой чат отдела.")
+    where_to = "без отдела" if team is None else f"отдел «{team}»"
     return (f"Уехало бы: {meeting.get('kind', 'встреча')} {meeting.get('date', '')} · "
-            f"отдел «{team}» · пунктов {len(items)} ({parts})\n"
+            f"{where_to} · пунктов {len(items)} ({parts})\n"
             f"{publication}\n"
             f"Адрес: {where}\n"
             f"Ничего не отправлено (--dry-run); пакет проверит сервер при отправке.")
@@ -220,7 +242,9 @@ def report_lines(body: dict) -> list:
     """Отчёт применения: что легло в списки и кому ушли уведомления."""
     report = body.get("report") or {}
     meeting = report.get("meeting") or {}
-    team = (body.get("team") or {}).get("name", "?")
+    # `team: null` — пакет без отдела (#522); ключа нет вовсе — сервер его не назвал.
+    where = ("без отдела" if "team" in body and body["team"] is None
+             else f"отдел «{(body.get('team') or {}).get('name', '?')}»")
     counts = report.get("counts") or {}
     if body.get("already_applied"):
         return [f"Этот пакет уже применялся ({body.get('applied_at', 'когда — не записано')}) "
@@ -230,7 +254,7 @@ def report_lines(body: dict) -> list:
     # чужом списке. У сервера, не знающего о ней, ключа нет — тогда и строки нет.
     outside = counts.get("outside", 0)
     lines = [f"Пакет применён: {meeting.get('kind', 'встреча')} {meeting.get('date', '')} · "
-             f"отдел «{team}»",
+             f"{where}",
              f"  себе: {counts.get('own', 0)} · другим: {counts.get('assigned', 0)}"
              + (f" · коллегам из других отделов: {outside}" if outside else "")]
     delivery = body.get("delivery")
@@ -249,8 +273,9 @@ def send(args, env: dict) -> int:
     # отправлять», и на ещё не настроенной машине это обещание обязано работать.
     url = client.base_url(env)
     raw, package = load_package(args.package)
+    selector = client.team(args.team, no_team=args.no_team)
     if args.dry_run:
-        print(preview(package, args.team, url + "/api/pc/meeting-package",
+        print(preview(package, selector, url + "/api/pc/meeting-package",
                       no_publish=args.no_publish))
         return client.EXIT_OK
     # Гейт «запиши» — ДО ключа и до сети. Дверей к серверу две, и держать он
@@ -258,18 +283,22 @@ def send(args, env: dict) -> int:
     # Страж слова (#508) — там же и по той же причине: в облаке подтверждённый
     # пакет на диске не значит, что человек сказал «запиши» перед отправкой.
     strazh.require_word_in_cloud()
-    client.require_confirmation(Path(args.package).expanduser(), args.team)
+    client.require_confirmation(Path(args.package).expanduser(), selector)
     key = client.access_key(env)
     # Параметр публикации едет ТОЛЬКО когда человек её отменил: сервер, не
     # знающий этой возможности, и путь по умолчанию обязаны остаться прежними.
-    query = {"team": args.team}
-    if args.no_publish:
-        query["publish"] = "0"
+    # Без отдела (#522) едет один признак: публиковать некуда, отдела нет.
+    if selector is None:
+        query = {"no_team": "1"}
+    else:
+        query = {"team": selector}
+        if args.no_publish:
+            query["publish"] = "0"
     body = client.call("POST", "/api/pc/meeting-package", url=url, key=key,
                        timeout=client.TIMEOUT_PACKAGE_SEC,
                        query=query, body=raw)
     lines = report_lines(body)
-    team = (body.get("team") or {}).get("name") or args.team
+    team = (body.get("team") or {}).get("name") or args.team or ""
     published, code = publication_lines(body.get("publication") or {}, team)
     print("\n".join(lines + published))
     return code
@@ -313,7 +342,8 @@ def local(args, env: dict) -> int:
             argv.append("--dry-run")
         return client.run_local(SCRIPT, argv)
     argv = ["apply-package", str(Path(args.package).expanduser().resolve()),
-            "--actor", str(client.actor_id(env, args.actor)), "--team", args.team]
+            "--actor", str(client.actor_id(env, args.actor))]
+    argv += ["--no-team"] if args.no_team else ["--team", args.team]
     if args.dry_run:
         argv.append("--dry-run")
     if args.publish:

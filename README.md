@@ -243,6 +243,8 @@ python meeting.py confirm --date <ДД.ММ.ГГ> --word "запиши"
 python meeting.py send    --date <ДД.ММ.ГГ> --team <отдел>
 python meeting.py send    --date <ДД.ММ.ГГ> --team <отдел> --no-publish
                                                        у отдела нет группы: без итога в чате
+python meeting.py send    --date <ДД.ММ.ГГ>             встреча без отдела (совет, 1:1):
+                                                       выгрузка была без --team, итога в чате нет
 python meeting.py publish --date <ДД.ММ.ГГ> --team <отдел>    досдать итог
 python meeting.py strazh  [--journal <журнал>]       самопроверка стража слова
 ```

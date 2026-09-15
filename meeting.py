@@ -724,6 +724,21 @@ def snapshot_fits(review: Path, selector: str | None) -> bool:
     return client.same_team(selector, team) is True
 
 
+def review_without_team(review: Path) -> bool:
+    """Разбор ведётся БЕЗ ОТДЕЛА (#522) — так его назвали, а не так вышло.
+
+    Судит расписка, если отправка была: что ушло на сервер, то и правда. До
+    отправки — подтверждение: снимок без отдела даёт `team: null`, и слово
+    человека относится к разбору по всем, кем он руководит. Ключа нет вовсе
+    (подтверждали без выгрузки в папке) — «без отдела» из молчания не выводится.
+    """
+    receipt = read_json(review / RECEIPT)
+    if receipt:
+        return "team" in receipt and receipt["team"] is None
+    record = read_json(review / CONFIRMED)
+    return bool(record) and "team" in record and record["team"] is None
+
+
 def sent_package(review: Path) -> bool:
     """Лежащий пакет применён сервером — по расписке ЭТОГО пакета."""
     receipt = read_json(review / RECEIPT)
@@ -807,6 +822,8 @@ def state(review: Path, env: dict, when: date) -> dict:
         # `published: true`, потому что итога в группе нет и говорить обратное
         # нельзя; и не `published: false`, потому что доделывать нечего.
         "publish_off": applied and receipt.get("exit_code") == client.EXIT_NO_PUBLISH,
+        # Разбор без отдела (#522): отправляется без `--team`, итога в группе нет.
+        "without_team": review_without_team(review),
         "receipt": receipt,
     }
 
@@ -874,13 +891,20 @@ def next_step(st: dict) -> tuple:
         return "confirm", ('Показать превью (meeting.py preview) и ждать слова человека. '
                            'Сказал «запиши» — meeting.py confirm --word "<его слова>"')
     if not st["sent"]:
+        if st.get("without_team"):
+            return "send", ("Отправить пакет на сервер: meeting.py send — без --team: "
+                            "разбор подтверждён без отдела, итога в группу не будет")
         return "send", "Отправить пакет на сервер: meeting.py send --team <отдел>"
     if not st["publish_off"] and not st["published"]:
         return "publish", ("Итог в группе неполон — досдать: "
                            "meeting.py publish --team <отдел>")
-    return finish_step(st, "Разбор закончен: задачи применены, публиковать итог было "
-                           "некуда — у отдела нет группового чата." if st["publish_off"]
-                       else "Разбор доведён до публикации.")
+    if st["publish_off"]:
+        finished = ("Разбор закончен: задачи применены, итога в группу у встречи без "
+                    "отдела нет." if st.get("without_team") else
+                    "Разбор закончен: задачи применены, публиковать итог было некуда — "
+                    "у отдела нет группового чата.")
+        return finish_step(st, finished)
+    return finish_step(st, "Разбор доведён до публикации.")
 
 
 def finish_step(st: dict, finished: str) -> tuple:
@@ -1725,9 +1749,14 @@ def cmd_confirm(args, env: dict) -> int:
     # Отдел приезжает из СНИМКА, а не из флага: флага у `confirm` нет и быть не
     # должно — человек подтверждает тот разбор, который ему показали, а показан
     # он по составу снимка. Записанный здесь отдел потом сверяет отправка.
+    #
+    # Снимка в папке нет — ключ не пишется вовсе (#522): отдел неизвестен, а не
+    # «без отдела». `team: null` значит разбор без отдела, и выводить его из
+    # отсутствия выгрузки нельзя — называет его только снимок без отдела.
+    snapped = read_json(review / TASKS) is not None
     (review / CONFIRMED).write_text(json.dumps({
         "package": digest(package),
-        "team": snapshot_team(review),
+        **({"team": snapshot_team(review)} if snapped else {}),
         "word": args.word.strip(),
         "at": datetime.now().isoformat(timespec="seconds"),
         **{name: numbers[name] for name in ("edits", "total_first") if name in numbers},
@@ -1748,18 +1777,29 @@ def cmd_confirm(args, env: dict) -> int:
             print("Внимание: последняя версия черновика с числом правок на сервер не "
                   "легла — пакет подтверждён, отправке это не мешает.", file=sys.stderr)
             client.fail(beda, env.get(client.KEY_ENV))
-    print("Дальше: meeting.py send --team <отдел>")
+    # Снимок без отдела — разбор без отдела (#522): флаг отдела при отправке тогда
+    # не называется, иначе сверка отдела откажет.
+    if snapped and snapshot_team(review) is None:
+        print("Дальше: meeting.py send — без --team: разбор снят без отдела, "
+              "итога в группу не будет")
+    else:
+        print("Дальше: meeting.py send --team <отдел>")
     return client.EXIT_OK
 
 
-def _same_receipt_team(recorded, selector: str) -> bool:
+def _same_receipt_team(recorded, selector: str | None) -> bool:
     """Тот ли отдел назван, что записан в расписке.
 
     В расписке лежит СЕЛЕКТОР словом человека («1» или «Продажи»), а не номер:
     что назвали, то и записали. Поэтому два написания одного отдела расписка
     различить не может, и расхождение ведёт не к отказу, а к повторному вызову
     сервера — тот узнаёт пакет по отпечатку и второй раз задачи не заводит.
+
+    ``selector=None`` — отправка без отдела (#522): совпадает только расписка без
+    отдела (`team: null`).
     """
+    if selector is None:
+        return recorded is None
     return isinstance(recorded, str) and recorded.strip().lower() == selector.strip().lower()
 
 
@@ -1786,8 +1826,11 @@ def server_draft_job(review: Path) -> int | None:
     return draft_job(review)
 
 
-def write_receipt(review: Path, package: Path, team: str, code: int) -> None:
-    """След отправки. Пишется ВСЕГДА — и на успех, и на отказ."""
+def write_receipt(review: Path, package: Path, team: str | None, code: int) -> None:
+    """След отправки. Пишется ВСЕГДА — и на успех, и на отказ.
+
+    ``team=None`` — разбор без отдела (#522): в расписке `team: null`.
+    """
     (review / RECEIPT).write_text(json.dumps({
         "package": digest(package),
         "team": team,
@@ -1806,9 +1849,12 @@ def cmd_send(args, env: dict) -> int:
     # на диске не значит, что человек сказал «запиши» перед ЭТОЙ отправкой.
     strazh.require_word_in_cloud()
     review = folder_for(args)
-    # Отдел спрашивается ДО всего остального: забытый флаг не должен оставлять
-    # ни расписки, ни половины работы.
-    team = client.team(args.team)
+    # Отдел или «без отдела» судится ДО всего остального: забытый флаг не должен
+    # оставлять ни расписки, ни половины работы. «Без отдела» (#522) называет
+    # снимок, по которому подтверждали разбор, — флага у `send` для него нет:
+    # пустой `--team` значит «без отдела» только у подтверждённого без отдела,
+    # и судит это `require_confirmation` ниже, до сети.
+    team = (args.team or "").strip() or None
     package = review / PACKAGE
     if not (review / CONFIRMED).is_file() and (review / DRAFT).is_file():
         raise client.Usage(
@@ -1816,8 +1862,8 @@ def cmd_send(args, env: dict) -> int:
             ["сначала превью и слово человека: meeting.py preview, затем "
              'confirm --word "<его слова>"',
              f"черновик разбора на месте: {review / DRAFT}"])
-    # Гейт «запиши» и сверку отдела судит ОДНА функция на обоих клиентов —
-    # прямой `send_package.py` спрашивает её же.
+    # Гейт «запиши», сверку отдела и развилку «с отделом или без» судит ОДНА
+    # функция на обоих клиентов — прямой `send_package.py` спрашивает её же.
     client.require_confirmation(package, team)
     st = state(review, env, meeting_date(getattr(args, "date", None)))
     # Пропуск повтора — только если отдел ТОТ ЖЕ. Расписка знает свой отдел, и
@@ -1855,13 +1901,15 @@ def cmd_send(args, env: dict) -> int:
                 ["поправь черновик, покажи превью и подтверди заново",
                  "устарел снимок — сделай выгрузку: meeting.py tasks"])
 
-    argv = ["--package", str(package), "--team", team]
+    # Без отдела (#522) едет признак на месте отдела: публиковать некуда вовсе.
+    argv = ["--package", str(package)] + (["--no-team"] if team is None
+                                          else ["--team", team])
     if args.dry_run:
         argv.append("--dry-run")
     # Просьба «не публиковать» едет клиенту дословно: у отдела может не быть
     # группы по решению руководителя, и догадаться об этом ни один из двух
     # клиентов не вправе (тикет #280).
-    if args.no_publish:
+    if args.no_publish and team is not None:
         argv.append("--no-publish")
     code = send_package.main(argv)
     if not args.dry_run:
@@ -1872,6 +1920,13 @@ def cmd_send(args, env: dict) -> int:
 def cmd_publish(args, env: dict) -> int:
     """Досдача итога в чат отдела. Всегда идёт на сервер — это её работа."""
     review = folder_for(args)
+    # У разбора без отдела (#522) итога в группе нет и не будет — досдавать
+    # нечего, какой бы отдел ни назвали: сервер его отчёт не опубликует, а чужой
+    # последний итог в чат второй раз уезжать не должен.
+    if review_without_team(review):
+        raise client.Usage(
+            "Итога в группе у встречи без отдела нет — досдавать нечего",
+            ["разбор без отдела закончен отправкой: задачи в списках, уведомления ушли"])
     team = client.team(args.team)
     # Отдел сверяется с распиской ЭТОГО разбора. Досдача публикует последний
     # применённый пакет НАЗВАННОГО отдела, а не пакет этой папки: назови другой
