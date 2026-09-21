@@ -122,6 +122,14 @@ EXPORT_FORMAT = "oblako-tasks-export"
 MEETINGS_FORMAT = "oblako-meetings"
 MEETINGS_VERSION = 1
 
+# --- версия формата выгрузки срезов (#540) ----------------------------------
+# ТРЕТЬЯ СВОЯ ПАРА, по тому же доводу, что у ручек автомата: срез в пакет разбора
+# не входит, его читает агент и кладёт в документы. Подними сервер ради среза
+# версию разбора — встал бы разбор у всех, кто пакет не обновил. То же, что
+# `SLICE_EXPORT_FORMAT` и `SLICE_EXPORT_VERSION` в `bot/core.py`.
+SLICE_FORMAT = "oblako-slice-export"
+SLICE_VERSION = 1
+
 # --- отчёт автомата о расшифровке (#454) ------------------------------------
 # Потолок строки — копия серверного (`core.TRANSCRIPT_REPORT_LINE_MAX`), и
 # держится он ЗДЕСЬ, а не в `avtomat.py`. Причина сбоя приезжает из чужих
@@ -189,15 +197,24 @@ class Refused(ClientError):
     ещё не выкачен, и повторяет себя без этого поля. Разбирать формулировку
     значило бы завести второго судью причины — тот же довод, что у
     `team_without_chat` ниже.
+
+    ИСКЛЮЧЕНИЕ ОДНО И НАЗВАНО: `export_slice` читает `reason`, чтобы отличить
+    адрес, которого у сервера нет, от «не найдено» ядра. Кода у этой разницы
+    нет — оба ответа несут `not_found`, — и слова здесь единственный признак.
+    Почему это безопасно — у `NO_ADDRESS_WORDS`.
     """
 
     exit_code = EXIT_REFUSED
 
     def __init__(self, message: str, details: Optional[list] = None,
-                 status: Optional[int] = None, field: Optional[str] = None):
+                 status: Optional[int] = None, field: Optional[str] = None,
+                 reason: str = ""):
         super().__init__(message, details)
         self.status = status
         self.field = field
+        # Слова сервера как есть, без нашей рамки, — только у общего отказа
+        # (`_refusal`, последняя ветка): у ключа и предела тела их нет.
+        self.reason = reason
 
 
 class Unreachable(ClientError):
@@ -415,6 +432,15 @@ def check_export(snapshot: dict) -> None:
                  what="выгрузка Oblako",
                  tail_stale=" Разбор пока не собрать.",
                  tail_ahead=" Потом начинай разбор заново.")
+
+
+def check_slice(answer: dict) -> None:
+    """Выгрузка срезов — того ли формата и версии. Правило — `check_format`.
+
+    Хвостов совета нет: срез — чтение без продолжения, пересобирать нечего.
+    """
+    check_format(answer, fmt=SLICE_FORMAT, ours=SLICE_VERSION,
+                 what="выгрузка срезов Oblako")
 
 
 def base_url(env: dict) -> str:
@@ -889,6 +915,7 @@ def _refusal(refusal: urllib.error.HTTPError) -> ClientError:
         details=details,
         status=refusal.code,
         field=str(body.get("field") or "") or None,
+        reason=message,
     )
 
 
@@ -1041,6 +1068,53 @@ def review_failed(meeting_id: int, body: dict, *, url: str, key: str) -> dict:
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     return call("POST", f"/api/pc/reviews/{int(meeting_id)}/failed", url=url, key=key,
                 timeout=TIMEOUT_READ_SEC, body=raw)
+
+
+# ---------------------------------------------------------------------------
+# Выгрузка срезов (#540, зовёт её `fetch_slice.py`)
+# ---------------------------------------------------------------------------
+# Слова сервера на адрес, которого у него НЕТ: общий ответ Flask на 404
+# (`_HTTP_MAP` в `bot/web.py`) или пустота, если ответил не Flask. Это
+# единственное место, где клиент судит по словам, а не по коду (см. `Refused`):
+# кода у разницы нет. Отказ ядра «не найдено» на пути среза всегда называет, чего
+# нет («Нет отдела «Склад» среди ваших…»), и голым не бывает. Устареть этой
+# строке не страшно: ею отвечает ровно тот сервер, что ручки ещё не знает, — а он
+# уже выкачен таким, какой есть. Совпадение с сервером заперто тестом.
+NO_ADDRESS_WORDS = ("", "Не найдено")
+
+
+def export_slice(*, url: str, key: str, date_from: str, date_to: str,
+                 team: Optional[str] = None) -> dict:
+    """Срезы своих людей за период — ответ `GET /api/pc/export-slice`, сверенный.
+
+    Круг судит сервер, как у выгрузки задач: без отдела — все свои люди и сам
+    предъявитель ключа, с отделом — его состав. Даты уезжают, как их назвали:
+    судья периода один, это сервер (`core.slice_period`), и его отказ приедет
+    фразой с кодом 2.
+
+    АДРЕСА НЕТ — НЕ ОТКАЗ, А ОТСТАВШИЙ СЕРВЕР, и код у него тот же, что у «отстал
+    сервер» в `check_format`: 1. Сервер ответил, сеть исправна, повтор
+    бессмыслен, а помогает одно действие — и не этого человека. Голое «не
+    найдено» с кодом 2 водило бы его проверять отдел и ключ.
+
+    ФОРМА ОТВЕТА СВЕРЯЕТСЯ ВСЕГДА: незнакомые параметры сервер молча игнорирует,
+    и ответ «не тем» пришёл бы с кодом 200.
+    """
+    query = {"from": date_from, "to": date_to}
+    if team:
+        query["team"] = team
+    try:
+        answer = call("GET", "/api/pc/export-slice", url=url, key=key,
+                      timeout=TIMEOUT_READ_SEC, query=query)
+    except Refused as refusal:
+        if refusal.status == 404 and refusal.reason in NO_ADDRESS_WORDS:
+            raise Usage(
+                "Сервер ещё не умеет срез — скажи владельцу системы: сервер нужно "
+                "обновить. Пакет здесь ни при чём, обновлять его не нужно."
+            ) from None
+        raise
+    check_slice(answer)
+    return answer
 
 
 # ---------------------------------------------------------------------------
