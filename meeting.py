@@ -269,6 +269,16 @@ NAME_BY_MEETING = ("*.vtt",)
 OP_MARK = {"add": "➕", "close": "✅", "edit": "✏️"}
 OP_TITLE = {"add": "Новые", "close": "Закрыть", "edit": "Править"}
 
+# ПОМЕТКИ ЧЕЛОВЕКА У НОВОЙ ЗАДАЧИ (#589, спека #584, Д14) — ключи `importance` и
+# `needs_comment` у `add` (`core.PACKAGE_ADD_MARKS`). Ставит их только автор
+# разбора на экране; окно их переносит как есть и показывает тем видом, что
+# свёрнутая строка экрана (`web/js/views/review.js`): 🔥 перед названием важной
+# (важная — тройка, как у списка задач), « · с комментарием» хвостом строки дат.
+# Иначе руководитель узнал бы о них только после слова «отправляй».
+IMPORTANT = 3
+IMPORTANT_MARK = "🔥 "
+WITH_COMMENT = "с комментарием"
+
 
 # ---------------------------------------------------------------------------
 # Папка разбора
@@ -1696,6 +1706,9 @@ def _dates_of(item: dict) -> str:
     строке превью читается как «дата есть, просто не показали», и руководитель
     узнал бы правду уже после слова «отправляй». Поэтому — слово, а не пустота.
     У правки такого слова нет: там пустой хвост означает «даты не трогаем».
+
+    Просьба о комментарии у новой задачи — хвостом этой строки (`WITH_COMMENT`):
+    «рабочий день 2026-08-10 · с комментарием», без дат — «без даты · с комментарием».
     """
     parts = []
     for key, label in (("due", "рабочий день"), ("deadline", "дедлайн")):
@@ -1706,9 +1719,21 @@ def _dates_of(item: dict) -> str:
             parts.append(f"{label} {item[key] or 'снять'}")
     if "new_text" in item:
         parts.append(f"текст → «{item['new_text']}»")
-    if not parts and item.get("op") == "add":
-        return NO_DATE
+    if item.get("op") == "add":
+        if not parts:
+            parts.append(NO_DATE)
+        if item.get("needs_comment"):
+            parts.append(WITH_COMMENT)
     return " · ".join(parts)
+
+
+def _head_of(item: dict) -> str:
+    """Главная строка пункта в превью и в уточнениях: задача правки — номером и
+    текстом, новая — названием, важная — с 🔥 перед ним (`IMPORTANT_MARK`)."""
+    if str(item.get("op", "?")) in ("close", "edit"):
+        return f"[#{item.get('task_id')}] {item.get('task_text', '')}"
+    mark = IMPORTANT_MARK if item.get("importance") == IMPORTANT else ""
+    return f"{mark}{item.get('text', '')}"
 
 
 def preview_lines(package: dict, snapshot: dict, marks: list | None = None,
@@ -1802,10 +1827,9 @@ def preview_lines(package: dict, snapshot: dict, marks: list | None = None,
                 continue
             lines.append(f"{OP_TITLE.get(op, op)}:")
             for item, mark, note in listed_items:
-                head = (f"[#{item['task_id']}] {item.get('task_text', '')}"
-                        if op in ("close", "edit") else item.get("text", ""))
                 tail = _dates_of(item)
-                lines.append(f"  {OP_MARK.get(op, '•')} {head}" + (f" — {tail}" if tail else "")
+                lines.append(f"  {OP_MARK.get(op, '•')} {_head_of(item)}"
+                             + (f" — {tail}" if tail else "")
                              + (f" — ✂️ {mark}" if mark else "")
                              + (f" — ℹ️ {note}" if note else ""))
         lines.append("")
@@ -1822,12 +1846,10 @@ def clarify_lines(asked: list) -> list:
     lines = ["⚠️ Требует уточнения — не уйдёт, пока человек не ответит:"]
     for item in asked:
         op = str(item.get("op", "?"))
-        head = (f"[#{item.get('task_id')}] {item.get('task_text', '')}"
-                if op in ("close", "edit") else item.get("text", ""))
         who = item.get("person_name") or (f"id={item['person_id']}" if item.get("person_id")
                                           else "исполнитель не назван")
         lines.append(f"  ❓ {item.get(CLARIFY)} — предложено: {OP_MARK.get(op, '•')} "
-                     f"{who}: {head}")
+                     f"{who}: {_head_of(item)}")
     return lines
 
 
