@@ -16,9 +16,10 @@
     Zoom            у ключа есть право на транскрипт помощника — иначе имена
                     говорящих придут через полчаса или не придут вовсе
     папки           `Разборы` и `Аудио` есть (нет — заводим тут же)
-    команды агенту  указатели разложены и не устарели
+    команды агенту  указатели разложены в домашней папке (все разговоры
+                    компьютера, а не одна папка пакета) и не устарели
     страж слова     хук Claude Code рядом с командами: без слова человека
-                    `confirm` и `send` не проходят
+                    не проходят `confirm`, `send` и запись задач
     Библиотека      клоны на месте, `origin` наш, имя автора задано
     автомат         подключён ли, и на месте ли здесь всё, что ему отдали
     сервер          живой ответ по ключу: адрес, ключ, права и состав разом
@@ -233,23 +234,29 @@ def check_folders(report: Report) -> None:
               + (f" (создано: {', '.join(made)})" if made else ""))
 
 
+CONNECT = "python install_skills.py --home"
+"""Подключение команд и стража ко всему Claude на компьютере (#680): задачи
+ставят из любого разговора, а не только из папки пакета. Поэтому проверка
+смотрит в домашнюю папку — подключение к одной папке пакета (так ставили
+сборки до 1.24) для неё не подключение."""
+
+
 def check_skills(report: Report) -> None:
-    """Указатели на команды разложены по папкам клиентов и не устарели.
+    """Указатели на команды разложены в домашней папке (`CONNECT`) и не устарели.
 
     Считает ТО ЖЕ, что и раскладывает (`install_skills.pointers`): второй
     счётчик однажды разошёлся бы с первым, и проверка хвалила бы неподключённое.
     """
     try:
         names = [name for name, _, _ in install_skills.skills()]
-        root = install_skills.targets(home=False)
+        root = install_skills.targets(home=True)
         stale = sum(1 for *_, same in install_skills.pointers(root) if not same)
     except (client.ClientError, OSError) as error:
-        report.bad("Команды агенту", getattr(error, "message", str(error)),
-                   "python install_skills.py")
+        report.bad("Команды агенту", getattr(error, "message", str(error)), CONNECT)
         return
     if stale:
         report.bad("Команды агенту", f"не подключено или устарело: {stale}",
-                   "python install_skills.py, потом перезапусти клиента")
+                   f"{CONNECT}, потом перезапусти клиента")
         return
     report.ok("Команды агенту", ", ".join(names))
 
@@ -262,14 +269,13 @@ def check_guard(report: Report) -> None:
     установкой и хвалил бы неподключённое.
     """
     try:
-        settings, state = install_skills.guard(install_skills.targets(home=False))
+        settings, state = install_skills.guard(install_skills.targets(home=True))
     except (client.ClientError, OSError) as error:
-        report.bad("Страж слова", getattr(error, "message", str(error)),
-                   "python install_skills.py")
+        report.bad("Страж слова", getattr(error, "message", str(error)), CONNECT)
         return
     if state != "same":
         report.bad("Страж слова", f"хук {strazh.HOOK_STATE_WORDS[state]}: {settings}",
-                   "python install_skills.py, потом перезапусти клиента")
+                   f"{CONNECT}, потом перезапусти клиента")
         return
     report.ok("Страж слова", f"хук Claude Code в {settings}")
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""strazh.py — страж слова: сказал ли «отправляй» сам человек (#508, Р8′).
+"""strazh.py — страж слова: сказал ли команду сам человек (#508, Р8′; #680).
 
 ЗАЧЕМ ОН ЕСТЬ. Разбор планёрки в облаке делает рутина Claude Code, а рутина
 идёт БЕЗ ПОДТВЕРЖДЕНИЙ: первый ход окна проходит без человека, и модель, только
@@ -9,6 +9,17 @@
 где его говорят люди друг другу. Страж читает ЖУРНАЛ РАЗГОВОРА (JSONL, его ведёт
 Claude Code) и пропускает `meeting.py confirm` и `send`, только если слово пришло
 сообщением самого человека.
+
+ДВЕРЬ ЗАДАЧ — СО СВОИМ СЛОВОМ (#680, спека #675). `postanovka.py add|edit|drop`
+ставит, правит и снимает задачу сразу, без показа («поставь Арине сверку до
+пятницы» — и задача ушла). Слово в `--word` пишет модель, а «поставь» она
+читает и в документе, который разбирает с человеком, — поэтому и эту запись
+страж сверяет с журналом. Журнал разбирается ОДИН на разбор и задачи (`judge`),
+различаются они судьёй слова и показом (`Door`): разбор открывает только
+«отправляй» (`oblako_client.confirmed_by`), задачи — свой набор
+(`oblako_client.task_ordered_by`: «поставь», «поправь», «сними», «отправляй»).
+«Поставь» отправку разбора не открывает. Чтение задач (`people`, `mine`) не
+судится.
 
 ПРАВИЛО — БЕЛЫЙ СПИСОК, А НЕ «ВСЁ ПОСЛЕ ПЕРВОГО СООБЩЕНИЯ». Сообщение человека —
 запись `type: user` с пометкой `origin.kind = human`, без блоков `tool_result` и
@@ -38,7 +49,9 @@ Claude Code) и пропускает `meeting.py confirm` и `send`, тольк�
 сообщения модель уже вызвала показ разбора (`meeting.py preview`). Слово,
 сказанное раньше, не переживает следующего сообщения: после «отправляй» человек
 мог попросить правку. Поэтому повтор отправки («попробуй ещё раз», «без
-публикации») требует нового «отправляй» — решение руководителя 13.09.2026.
+публикации») требует нового «отправляй» — решение руководителя 13.09.2026. У
+двери задач — то же, но своим судьёй и БЕЗ показа: запуск и отправка у неё —
+одно сообщение человека.
 
 НЕЗНАКОМОЕ — ЗАПРЕТ (FAIL-CLOSED). Формат журнала — исследовательская часть
 Claude Code и может меняться. Нет журнала, он не читается, строка не разбирается
@@ -49,37 +62,46 @@ Claude Code и может меняться. Нет журнала, он не ч�
 окна и с компьютера разом, ничего не прибавив к защите — слово человека в них
 не живёт.
 
-ДВА НОСИТЕЛЯ, ОДИН РАЗБОР. (1) Проверка внутри скрипта у ОБЕИХ дверей к серверу —
-`meeting.py confirm`/`send` и `send_package.py --package`: в облаке
-(`CLAUDE_CODE_REMOTE=true`) скрипт сам находит журнал окна — самый свежий
-`*.jsonl` в `~/.claude/projects` — и судит его (`require_word_in_cloud`). На
-компьютере журнал скриптом не судится: у Codex его нет вовсе, и держит
-`confirm --word`, как прежде. (2) Хук `PreToolUse` Claude Code (`python strazh.py
-hook`): берёт журнал из своего входа (`transcript_path`), судит тем же `judge` и
-запрещает команду с объяснением модели. Хук ставят в файл настроек Claude Code
-(`install_hook`): в облаке — `avtomat.py run` в `~/.claude/settings.json`
-машины, на компьютере — `install_skills.py` рядом со скиллами. Хук молчит на
-любую другую команду и молчит на пропуске: разрешение от хука перебило бы вопрос
-о правах, который человек на компьютере видит у каждой команды.
+ДВА НОСИТЕЛЯ, ОДИН РАЗБОР. (1) Проверка внутри скрипта у ОБЕИХ дверей разбора к
+серверу — `meeting.py confirm`/`send` и `send_package.py --package` — и у записей
+`postanovka.py`: в облаке (`CLAUDE_CODE_REMOTE=true`, ключ там лежит в окружении
+машины) скрипт сам находит журнал окна — самый свежий `*.jsonl` в
+`~/.claude/projects` — и судит его для своей двери (`require_word_in_cloud`). На
+компьютере журнал скриптом не судится: у Codex его нет вовсе, и держат
+`confirm --word` и `postanovka.py --word`. (2) Хук `PreToolUse` Claude Code
+(`python strazh.py hook`): берёт журнал из своего входа (`transcript_path`),
+судит тем же `judge` и запрещает команду с объяснением модели. Хук ставят в
+файл настроек Claude Code (`install_hook`): в облаке — `avtomat.py run` в
+`~/.claude/settings.json` машины, на компьютере — `install_skills.py --home`
+туда же, рядом со скиллами: задачи ставят из любого разговора, и страж должен
+стоять во всех, а не только в папке пакета. Цена этого — папку пакета после
+подключения не переносят: хук с пропавшим скриптом запрещает КАЖДУЮ команду во
+всех проектах (`hook_answer`). Хук молчит на любую другую команду и молчит на
+пропуске: разрешение от хука перебило бы вопрос о правах, который человек на
+компьютере видит у каждой команды.
 
-ВЫЗОВ, А НЕ УПОМИНАНИЕ (#520). Хук судит команду, которая ВЫЗЫВАЕТ подтверждение
-или отправку, а не любую, где встретились эти слова: `git commit -m "…meeting.py
-send…"`, `gh issue comment`, `grep "meeting.py send"` — упоминание, хук молчит
-(без этого запрет получали коммиты и комментарии к тикетам в окнах разработки,
-куда хук кладёт `install_skills.py`). Строка режется так, как её режет оболочка
-(`_Shell`, bash или PowerShell — по имени инструмента), и совпадение прощается,
-только если целиком лежит в словах программы, которая текст лишь ищет, читает
-или печатает (`TEXT_PROGRAMS`), а её вывод не уходит по `|` программе другого
-рода. Подстановка `$(…)` исполняется и внутри такой программы — судится по
-своему содержимому. Всё прочее — строку не разобрать, программа не из списка —
-судится, как раньше: промах в сторону запрета стоит повторного «отправляй», в
-сторону пропуска — чужих задач. Хук держит отправку, в которую модель тянется
-по инерции, а не нарочный обход (скрипт, записанный прошлым шагом; программа из
-списка, которой велено исполнить команду): его в облаке держит проверка внутри
-скрипта.
+ВЫЗОВ, А НЕ УПОМИНАНИЕ (#520). Хук судит команду, которая ВЫЗЫВАЕТ
+подтверждение, отправку или запись задачи, а не любую, где встретились эти
+слова: `git commit -m "…meeting.py send…"`, `gh issue comment`, `grep
+"meeting.py send"` — упоминание, хук молчит (без этого запрет получали коммиты
+и комментарии к тикетам в окнах разработки, куда хук кладёт
+`install_skills.py`, а с `--home` — и во всех проектах компьютера). Строка
+режется так, как её режет оболочка (`_Shell`, bash или PowerShell — по имени
+инструмента), и совпадение прощается, только если целиком лежит в словах
+программы, которая текст лишь ищет, читает или печатает (`TEXT_PROGRAMS`), а её
+вывод не уходит по `|` программе другого рода. Подстановка `$(…)` исполняется и
+внутри такой программы — судится по своему содержимому. Всё прочее — строку не
+разобрать, программа не из списка — судится, как раньше: промах в сторону
+запрета стоит повторного слова человека, в сторону пропуска — чужих задач. Хук
+держит отправку, в которую модель тянется по инерции, а не нарочный обход
+(скрипт, записанный прошлым шагом; программа из списка, которой велено
+исполнить команду): его в облаке держит проверка внутри скрипта — и у разбора,
+и у двери задач, — а на компьютере только судья слова самого скрипта
+(`confirm --word`, `postanovka.py --word`).
 
     python strazh.py hook        вход хука PreToolUse (читает stdin)
     python meeting.py strazh     самопроверка: вердикт по журналу этого окна
+                                 (только для отправки разбора)
 
 Зависимостей нет — только стандартная библиотека.
 """
@@ -91,7 +113,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import oblako_client as client
 
@@ -102,19 +124,36 @@ REMOTE_ENV = "CLAUDE_CODE_REMOTE"      # облачная сессия Claude Co
 # Команды, которые страж судит, и команда показа. Между именем скрипта и
 # подкомандой бывают кавычки (`python "<папка команд>/meeting.py" send` — так
 # пишет указатель скилла; `meeting.py "send"`), перенос строки `\` (PowerShell —
-# обратной кавычкой) и — в сыром JSON входа хука — экранирующий `\"`: всё это
-# разрешено, иначе обход стража стоил бы одной пары кавычек. Тот же скрипт
-# зовут и модулем (`python -m meeting send`, `meeting.main([... "send"])`).
-# Дверей к серверу у пакета ДВЕ (шапка `oblako_client.require_confirmation`):
-# вторая — `send_package.py --package`, и `argparse` понимает флаг сокращённым
-# вплоть до `--pa`. Это текст, в котором ИЩУТ вызов; упоминание от вызова
-# отличает разбор строки (`_calls_sending`, шапка).
+# обратной кавычкой), конец флагов `--` (`argparse` его принимает) и — в сыром
+# JSON входа хука — экранирующий `\"`: всё это разрешено, иначе обход стража
+# стоил бы одной пары кавычек. Тот же скрипт зовут и модулем (`python -m meeting
+# send`, слитно `-mmeeting`, `meeting.main([... "send"])`), а на Windows имя
+# файла — в любом регистре (`Meeting.py`). Это текст, в котором ИЩУТ вызов;
+# упоминание от вызова отличает разбор строки (`_calls`, шапка).
 _GAP = r"""[\\"'`\s]+"""
-SENDING = re.compile(rf"""meeting\.py{_GAP}(confirm|send)\b"""
-                     rf"""|(?<![\w-])-m{_GAP}meeting{_GAP}(confirm|send)\b"""
-                     r"""|\bmeeting\.main\b[\s\S]{0,200}?\b(confirm|send)\b"""
-                     r"""|send_package\.py\b[\s\S]{0,500}?--pa(?:c(?:k(?:a(?:ge?)?)?)?)?\b""")
+
+
+def _invocation(module: str, subcommands) -> str:
+    """Вызов подкоманды скрипта пакета во всех видах, перечисленных выше. Один на
+    разбор и задачи: второй список видов однажды отстал бы от первого."""
+    sub = "|".join(subcommands)
+    return (rf"""{module}\.py{_GAP}(?:--{_GAP})?({sub})\b"""
+            rf"""|(?<![\w-])-m[\\"'`\s]*{module}{_GAP}(?:--{_GAP})?({sub})\b"""
+            rf"""|\b{module}\.main\b[\s\S]{{0,200}}?\b({sub})\b""")
+
+
+# Дверей к серверу у разбора ДВЕ (шапка `oblako_client.require_confirmation`):
+# вторая — `send_package.py --package`, и `argparse` понимает флаг сокращённым
+# вплоть до `--pa`.
+SENDING = re.compile(_invocation("meeting", ("confirm", "send"))
+                     + r"""|send_package\.py\b[\s\S]{0,500}?--pa(?:c(?:k(?:a(?:ge?)?)?)?)?\b""",
+                     re.IGNORECASE)
 PREVIEW = re.compile(rf"""meeting\.py{_GAP}preview\b""")
+# Записи двери задач (#680) — подкоманды `postanovka.WRITES` (тест гоняет хук по
+# каждой из них). Чтение (`people`, `mine`) ничего не пишет и не судится.
+# Подкоманду `argparse` сокращённой не понимает — полных имён хватает.
+TASK_WRITE_COMMANDS = ("add", "edit", "drop")
+TASK_WRITES = re.compile(_invocation("postanovka", TASK_WRITE_COMMANDS), re.IGNORECASE)
 
 # Программы, которые текст команды только ищут, читают или печатают: совпадение
 # в их словах — упоминание (шапка, «Вызов, а не упоминание»). Список закрытый:
@@ -152,6 +191,9 @@ NO_WORD = "в последнем сообщении человека нет сл
 IN_QUEUE = "последнее сообщение человека ещё в очереди — модель его не прочла"
 NOT_SHOWN = "до слова человека разбор не показан"
 UNKNOWN = "формат журнала незнаком"
+TASK_PASS = "команда двери задач — в последнем сообщении человека"
+TASK_NO_WORD = ("в последнем сообщении человека нет команды «поставь», «поправь», "
+                "«сними» или «отправляй»")
 
 FROM_COMPUTER = "отправьте с компьютера: скажите помощнику «разбери планёрку»"
 
@@ -161,6 +203,39 @@ class Verdict(NamedTuple):
 
     allow: bool
     why: str
+
+
+class Door(NamedTuple):
+    """Что стережёт страж — разбор или задачи: чем узнать вызов записи и чьё
+    слово её открывает.
+
+    Журнал у них разбирается один (`judge`), различаются они только этим —
+    поэтому слово задач разбор не открывает (шапка, «Дверь задач»).
+    """
+
+    calls: re.Pattern               # вызов записи — текст, в котором его ищут
+    ordered: Callable[[str], None]  # судья слова: молчание — пропуск, иначе `client.Usage`
+    shown_first: bool               # слово судится только после показа разбора
+    no_word: str                    # причина запрета, когда слова нет
+    passed: str                     # причина пропуска
+    refused: str                    # начало отказа: чего у человека не было
+    asks: tuple                     # что сказать модели в отказе
+    elsewhere: Optional[str]        # куда идти, если окно в облаке
+
+
+REVIEW = Door(SENDING, client.confirmed_by, True, NO_WORD, WORD_PASS,
+              "слова человека в этом окне не было",
+              ("не подставляй «отправляй» за человека и не обходи эту проверку",
+               "человек в окне — пусть скажет «отправляй» сам, отдельным сообщением "
+               "после показа разбора"),
+              FROM_COMPUTER)
+TASKS = Door(TASK_WRITES, client.task_ordered_by, False, TASK_NO_WORD, TASK_PASS,
+             "команды человека нет",
+             ("не подставляй команду за человека и не обходи эту проверку",
+              "человек в окне — пусть сам скажет «поставь», «поправь» или «сними» "
+              "своим последним сообщением; «да» и «ок» — не команда"),
+             None)
+DOORS = (REVIEW, TASKS)
 
 
 class _Unknown(Exception):
@@ -270,17 +345,18 @@ def _shows_review(record: dict) -> bool:
     return False
 
 
-def _is_write_command(text: str) -> bool:
-    """Команда ли это «отправляй» — тем же судьёй, что у `confirm --word`."""
+def _is_write_command(text: str, door: Door) -> bool:
+    """Команда ли это — тем же судьёй, что у скрипта двери (`confirm --word`,
+    `postanovka.py --word`)."""
     try:
-        client.confirmed_by(text)
+        door.ordered(text)
     except client.Usage:
         return False
     return True
 
 
-def judge(path) -> Verdict:
-    """Вердикт по журналу разговора. Один на хук и на скрипт."""
+def judge(path, door: Door = REVIEW) -> Verdict:
+    """Вердикт по журналу разговора для двери `door`. Один на хук и на скрипт."""
     if not path or not isinstance(path, (str, os.PathLike)):
         return Verdict(False, NO_JOURNAL)
     path = Path(path)
@@ -325,12 +401,13 @@ def judge(path) -> Verdict:
     if last_queued is not None and last_queued[0] > number:
         # Новое последнее сообщение человека — но из очереди: закрыть может,
         # открыть нет (шапка, «Очередь»).
-        return Verdict(False, IN_QUEUE if _is_write_command(last_queued[1]) else NO_WORD)
-    if not _is_write_command(text):
-        return Verdict(False, NO_WORD)
-    if not any(at < number for at in shown_at):
+        return Verdict(False, IN_QUEUE if _is_write_command(last_queued[1], door)
+                       else door.no_word)
+    if not _is_write_command(text, door):
+        return Verdict(False, door.no_word)
+    if door.shown_first and not any(at < number for at in shown_at):
         return Verdict(False, NOT_SHOWN)
-    return Verdict(True, WORD_PASS)
+    return Verdict(True, door.passed)
 
 
 def find_journal() -> Optional[Path]:
@@ -358,28 +435,28 @@ def in_cloud() -> bool:
     return (os.environ.get(REMOTE_ENV) or "").strip().lower() == "true"
 
 
-def refusal(verdict: Verdict, cloud: bool) -> tuple:
+def refusal(verdict: Verdict, cloud: bool, door: Door = REVIEW) -> tuple:
     """Отказ словами модели: (сообщение, подробности). Один на оба носителя."""
-    details = ["не подставляй «отправляй» за человека и не обходи эту проверку",
-               "человек в окне — пусть скажет «отправляй» сам, отдельным сообщением "
-               "после показа разбора"]
-    if cloud:
-        details.append(FROM_COMPUTER)
-    return f"Страж слова: слова человека в этом окне не было — {verdict.why}", details
+    details = list(door.asks)
+    if cloud and door.elsewhere:
+        details.append(door.elsewhere)
+    return f"Страж слова: {door.refused} — {verdict.why}", details
 
 
-def require_word_in_cloud() -> None:
-    """В облаке — вердикт по журналу окна или отказ. На компьютере — ничего.
+def require_word_in_cloud(door: Door = REVIEW) -> None:
+    """В облаке — вердикт по журналу окна для двери `door` или отказ. На
+    компьютере — ничего.
 
-    Зовут обе двери к серверу — `meeting.py confirm`/`send` первым делом (запрет
-    не должен оставлять ни пакета, ни расписки) и `send_package.py --package`
-    рядом с гейтом отпечатка.
+    Зовут обе двери разбора к серверу — `meeting.py confirm`/`send` первым делом
+    (запрет не должен оставлять ни пакета, ни расписки) и `send_package.py
+    --package` рядом с гейтом отпечатка — и записи `postanovka.py` после её
+    судьи слова, до ключа и сети.
     """
     if not in_cloud():
         return
-    verdict = judge(find_journal())
+    verdict = judge(find_journal(), door)
     if not verdict.allow:
-        raise client.Usage(*refusal(verdict, cloud=True))
+        raise client.Usage(*refusal(verdict, cloud=True, door=door))
 
 
 # ---------------------------------------------------------------------------
@@ -619,9 +696,10 @@ def _mark_text(commands: list, mask: bytearray) -> None:
                 _mark_text(inner, mask)
 
 
-def _calls_sending(command: str, tool) -> bool:
-    """Вызывает ли команда подтверждение или отправку (шапка, «Вызов, а не упоминание»)."""
-    found = [match.span() for match in SENDING.finditer(command)]
+def _calls(door: Door, command: str, tool) -> bool:
+    """Вызывает ли команда запись двери — подтверждение, отправку, запись задачи
+    (шапка, «Вызов, а не упоминание»)."""
+    found = [match.span() for match in door.calls.finditer(command)]
     if not found:
         return False
     try:
@@ -646,34 +724,55 @@ def _deny(reason: str) -> str:
     }}, ensure_ascii=True)
 
 
-def _broken(what: str) -> str:
+def _door_in(raw: str) -> Optional[Door]:
+    """Дверь, чей вызов виден в сыром тексте входа, — или None.
+
+    Сырой вход — JSON с экранированными кавычками; `_GAP` их пропускает."""
+    return next((door for door in DOORS if door.calls.search(raw)), None)
+
+
+def _broken(what: str, door: Door) -> str:
     # «С компьютера» — только в облаке, как у `refusal`: на компьютере человек уже там.
-    where = f" {FROM_COMPUTER}." if in_cloud() else ""
-    return _deny(f"Страж слова: {what} — отправка без проверки запрещена.{where}")
+    where = f" {door.elsewhere}." if in_cloud() and door.elsewhere else ""
+    return _deny(f"Страж слова: {what} — запись без проверки запрещена.{where}")
 
 
 def hook_answer(raw: str) -> str:
     """Ответ хука на вход Claude Code: JSON с запретом или пустая строка.
 
-    Хук не спасает сбой ВНЕ Python: пропал интерпретатор из записанного пути,
-    вышел таймаут — Claude Code такую ошибку считает неблокирующей и команду
-    выполняет. Первое видит проверка установки (`hook_state`); в облаке отправку
-    держит и проверка внутри скрипта, на компьютере — `confirm --word`.
+    Команда, которая зовёт и отправку разбора, и запись задачи, судится по
+    каждой: пропуск — только когда пропускают обе.
+
+    Сбой ВНЕ Python этот код не видит, и исходы у него разные. Пропал
+    интерпретатор из записанного пути или вышел таймаут — Claude Code считает
+    ошибку неблокирующей и команду выполняет: запись держат проверка внутри
+    скрипта в облаке, `confirm --word` и `postanovka.py --word`. Пропал САМ
+    СКРИПТ (папку пакета перенесли или удалили) — `python` выходит кодом 2, а
+    для `PreToolUse` это запрет: каждая команда Bash и PowerShell запрещена
+    везде, куда хук подключён, с `--home` — во всех проектах, и агенту оттуда не
+    починить. Лечит человек сам: `python install_skills.py --home` из новой
+    папки пакета или запись стража вон из `~/.claude/settings.json`. Пропавший
+    интерпретатор и переехавшую папку видит проверка установки (`hook_state`:
+    «устарел»).
     """
     try:
         data = json.loads(raw)
         command = data.get("tool_input", {}).get("command")
         tool = data.get("tool_name")
     except (ValueError, AttributeError):
-        # Вход не разобрать — судим по сырому тексту: на отправке сбой — запрет.
-        return _broken("вход хука не разобрать") if SENDING.search(raw) else ""
-    if not isinstance(command, str) or not _calls_sending(command, tool):
+        # Вход не разобрать — судим по сырому тексту: на записи сбой — запрет.
+        door = _door_in(raw)
+        return _broken("вход хука не разобрать", door) if door else ""
+    if not isinstance(command, str):
         return ""
-    verdict = judge(data.get("transcript_path"))
-    if verdict.allow:
-        return ""
-    message, details = refusal(verdict, in_cloud())
-    return _deny(message + ". " + "; ".join(details) + ".")
+    for door in DOORS:
+        if not _calls(door, command, tool):
+            continue
+        verdict = judge(data.get("transcript_path"), door)
+        if not verdict.allow:
+            message, details = refusal(verdict, in_cloud(), door)
+            return _deny(message + ". " + "; ".join(details) + ".")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -810,9 +909,8 @@ def main(argv=None) -> int:
     try:
         answer = hook_answer(raw)
     except Exception as error:                  # сбой самого стража
-        # Сырой вход — JSON с экранированными кавычками; `SENDING` их пропускает.
-        answer = _broken(f"сбой стража ({type(error).__name__})") \
-            if SENDING.search(raw) else ""
+        door = _door_in(raw)
+        answer = _broken(f"сбой стража ({type(error).__name__})", door) if door else ""
     if answer:
         sys.stdout.write(answer + "\n")
     return client.EXIT_OK

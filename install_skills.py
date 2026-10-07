@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""install_skills.py — подключение команд разбора к Claude Code и к Codex (блок 5).
+"""install_skills.py — подключение команд пакета к Claude Code и к Codex (блок 5).
 
 СОДЕРЖИМОЕ ОБЩЕЕ, ПОДКЛЮЧЕНИЕ — СВОЁ У КАЖДОГО КЛИЕНТА. Инструкции живут в одной
 папке `Скиллы/` и правятся в одном месте. Клиенты ищут скиллы каждый в своей
@@ -17,15 +17,24 @@
 где описан скилл, не заводится.
 
 СТРАЖ СЛОВА ЕДЕТ ВМЕСТЕ СО СКИЛЛАМИ (#508). Хук Claude Code `PreToolUse`
-(`strazh.py`) судит по журналу разговора, сказал ли «отправляй» сам человек, прежде
-чем пропустить `meeting.py confirm` и `send`. Ложится туда же, куда скиллы: в
-`.claude/settings.json` рабочей копии или, с `--home`, домашней папки — чужие
-ключи и чужие хуки файла остаются как были, повтор себя не дублирует. У Codex
-хуков и журнала Claude нет: там держит `confirm --word`.
+(`strazh.py`) судит по журналу разговора, сказал ли команду сам человек, прежде
+чем пропустить `meeting.py confirm` и `send` («отправляй») и запись задач
+`postanovka.py add|edit|drop` («поставь», «поправь», «сними»). Ложится туда же,
+куда скиллы: в `.claude/settings.json` рабочей копии или, с `--home`, домашней
+папки — чужие ключи и чужие хуки файла остаются как были, повтор себя не
+дублирует. У Codex хуков и журнала Claude нет: там держат `confirm --word` и
+`postanovka.py --word`.
 
-    python install_skills.py            подключить в этой рабочей копии
-    python install_skills.py --check    что подключено и куда
-    python install_skills.py --home     подключить глобально (все проекты)
+ПАКЕТ ПОДКЛЮЧАЕТСЯ ГЛОБАЛЬНО (#680, спека #675). Задачи ставят из любого
+разговора на компьютере — над документом, таблицей, письмом, — а не только в
+папке пакета. Поэтому мастера установки и обновления и точка входа агента зовут
+`--home`, и проверка установки (`setup_check.py`) смотрит туда же. Без флага —
+подключение к одной рабочей копии.
+
+    python install_skills.py --home            подключить глобально (все разговоры)
+    python install_skills.py --home --check    что подключено глобально
+    python install_skills.py                   подключить в этой рабочей копии
+    python install_skills.py --check           что подключено в этой рабочей копии
 
 Зависимостей нет — только стандартная библиотека.
 """
@@ -170,7 +179,7 @@ def install(root: Path, dry: bool) -> int:
 
 def main(argv=None) -> int:
     client.setup_console()
-    parser = argparse.ArgumentParser(description="Подключение команд разбора к клиентам")
+    parser = argparse.ArgumentParser(description="Подключение команд пакета к клиентам")
     parser.add_argument("--home", action="store_true",
                         help="подключить глобально, а не в этой рабочей копии")
     parser.add_argument("--check", action="store_true", help="только показать состояние")
@@ -186,8 +195,9 @@ def main(argv=None) -> int:
     except OSError as error:
         return client.fail(client.Usage(f"Не удалось записать подключение: {error}"))
     if args.check:
+        again = "с --home, но без --check" if args.home else "без --check"
         print("Подключено всё." if not stale
-              else f"Не подключено или устарело: {stale}. Запусти без --check.")
+              else f"Не подключено или устарело: {stale}. Запусти {again}.")
         return client.EXIT_OK if not stale else client.EXIT_USAGE
     print("Клиент подхватит их при следующем запуске — перезапусти его.")
     return client.EXIT_OK
