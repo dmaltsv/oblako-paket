@@ -318,6 +318,41 @@ def folder_for(args) -> Path:
     return repo_root() / REVIEWS_DIR / meeting_date(getattr(args, "date", None)).strftime(DATE_FMT)
 
 
+# ДД.ММ.ГГ внутри имени папки, названной руками: «14.07.26 розница».
+FOLDER_DATE = re.compile(r"(?<!\d)\d{2}\.\d{2}\.\d{2}(?!\d)")
+
+
+def review_date(args, review: Path) -> date:
+    """Дата встречи разбора — по ней ищутся текст в Библиотеке и запись.
+
+    Явная `--date` сильнее всего; без `--folder` дата та же, что дала имя папке.
+
+    ПАПКА, НАЗВАННАЯ РУКАМИ, «СЕГОДНЯ» НЕ ЗНАЧИТ (#709). Пока без `--date` бралось
+    сегодняшнее число, разбор в «14.07.26 розница» искал текст и запись не за тот
+    день: свой транскрипт, уже положенный в Библиотеку, считался «ещё не
+    положенным», а без своего — «текста нет», и Deepgram платился второй раз.
+    Первой спрашивается карточка встречи — дату назвал сервер; за ней — имя
+    папки. Ни того, ни другого — отказ со словами: догадка тут и была бедой.
+    """
+    stated = getattr(args, "date", None)
+    if stated or not getattr(args, "folder", None):
+        return meeting_date(stated)
+    card = meeting_card(review)
+    try:
+        return datetime.strptime(str((card or {}).get("date")), library.ISO_DATE).date()
+    except ValueError:
+        pass
+    for found in FOLDER_DATE.findall(review.name):
+        try:
+            return datetime.strptime(found, DATE_FMT).date()
+        except ValueError:
+            continue
+    raise client.Usage(
+        f"Дата встречи не видна: в имени папки «{review.name}» её нет, карточки встречи "
+        f"в папке тоже нет.",
+        [f"назови её: --date ДД.ММ.ГГ (например {date.today().strftime(DATE_FMT)})"])
+
+
 # ---------------------------------------------------------------------------
 # Поиск записи
 # ---------------------------------------------------------------------------
@@ -1413,10 +1448,11 @@ def restore_draft(review: Path, env: dict) -> str | None:
 # ---------------------------------------------------------------------------
 def cmd_status(args, env: dict) -> int:
     review = folder_for(args)
+    when = review_date(args, review)
     # Черновик сервера — ДО подсчёта состояния (#514): восстановленный черновик и
     # есть сделанный шаг «извлечь», и следующий шаг обязан это знать.
     restored = restore_draft(review, env)
-    st = state(review, env, meeting_date(getattr(args, "date", None)))
+    st = state(review, env, when)
     key, what = next_step(st)
     st["next"] = key
     st["next_hint"] = what
@@ -1524,7 +1560,7 @@ def cmd_meetings(args, env: dict) -> int:
 
 def cmd_find(args, env: dict) -> int:
     review = folder_for(args)
-    when = meeting_date(getattr(args, "date", None))
+    when = review_date(args, review)
     audio, searched = find_audio(review, when, env)
     if not audio:
         raise client.Usage(
@@ -1560,11 +1596,11 @@ def cmd_transcribe(args, env: dict) -> int:
     видит: её печатает сам склейщик строкой выше.
     """
     review = folder_for(args)
-    when = meeting_date(getattr(args, "date", None))
     out = Path(args.out).expanduser() if args.out else review / TRANSCRIPT
     if out.is_file() and not args.force:
         print(f"[Пропуск] расшифровка уже есть: {out}")
         return client.EXIT_OK
+    when = review_date(args, review)
     # Готовый текст в Библиотеке — тот же сделанный шаг: Deepgram за него не
     # платим. `--force` — осознанное «расшифруй заново, не глядя на Библиотеку».
     if not args.force and not args.out:
@@ -2202,15 +2238,18 @@ def cmd_send(args, env: dict) -> int:
     # Гейт «отправляй», сверку отдела и развилку «с отделом или без» судит ОДНА
     # функция на обоих клиентов — прямой `send_package.py` спрашивает её же.
     record = client.require_confirmation(package, team)
-    st = state(review, env, meeting_date(getattr(args, "date", None)))
+    # Повтор судит РАСПИСКА, а не всё состояние разбора: поиску текста и записи
+    # нужна дата встречи (#709), отправке — нет, и папка без даты в имени не
+    # должна получать здесь отказ, к отправке отношения не имеющий.
+    receipt = read_json(review / RECEIPT) or {}
     # Пропуск повтора — только если отдел ТОТ ЖЕ. Расписка знает свой отдел, и
     # без сверки первая же опечатка в `--team` пряталась бы за «уже отправлено»:
     # разбор ушёл в чужой отдел, нужный не получил ничего, а человеку сказали,
     # что всё сделано.
-    receipt_team = (st["receipt"] or {}).get("team")
-    if st["sent"] and not args.dry_run and _same_receipt_team(receipt_team, team):
-        code = (st["receipt"] or {}).get("exit_code", client.EXIT_OK)
-        print(f"[Пропуск] этот пакет уже отправлен {(st['receipt'] or {}).get('at')} "
+    receipt_team = receipt.get("team")
+    if sent_package(review) and not args.dry_run and _same_receipt_team(receipt_team, team):
+        code = receipt.get("exit_code", client.EXIT_OK)
+        print(f"[Пропуск] этот пакет уже отправлен {receipt.get('at')} "
               f"(код {code}) — второй раз задачи не заводим.")
         if code == client.EXIT_PUBLISH_INCOMPLETE:
             print(f"Итог в группе неполон — досдать: meeting.py publish --team {team}")
@@ -2414,7 +2453,8 @@ def _parser() -> argparse.ArgumentParser:
 
     def common(name: str, help_text: str):
         sub = subs.add_parser(name, help=help_text)
-        sub.add_argument("--date", help="дата планёрки ДД.ММ.ГГ (по умолчанию сегодня)")
+        sub.add_argument("--date", help="дата планёрки ДД.ММ.ГГ (по умолчанию сегодня; "
+                                        "с --folder — из карточки встречи или имени папки)")
         sub.add_argument("--folder", help="папка разбора целиком (вместо --date)")
         return sub
 

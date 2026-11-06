@@ -70,6 +70,7 @@ import re
 import ssl
 import subprocess
 import sys
+import time
 import traceback
 import urllib.error
 import urllib.parse
@@ -103,6 +104,15 @@ TIMEOUT_PACKAGE_SEC = 120
 TIMEOUT_PUBLISH_SEC = 60
 # Запись двери задач (#679) тем же запросом шлёт уведомление получателю.
 TIMEOUT_TASK_SEC = 60
+
+# Паузы перед повтором запроса, сорвавшегося ДО ОТПРАВКИ (#717); попыток на одну
+# больше, чем пауз. С 04.11.2026 адрес сервера ведёт через посредника в России, и
+# облачная машина автомата то и дело не может с ним соединиться: проба 05.11 —
+# 3 сброса на рукопожатии из 40 соединений, а оба «Разобрать» того дня упали на
+# первом же запросе. Один такой сброс стоил всего запуска (код 3), и сервер
+# узнавал о нём только через два часа. Худший случай — около минуты на запрос:
+# прокси облачной машины рвёт соединение через ~10 с ожидания.
+CONNECT_RETRY_PAUSES_SEC = (2, 5, 10)
 
 # Потолок тела пакета. ИСТОЧНИК ПРАВДЫ — СЕРВЕР, здесь копия ради понятного
 # отказа до отправки: 413 без единого слова о причине читается хуже, чем «пакет
@@ -942,6 +952,11 @@ def call(method: str, path: str, *, url: str, key: str, timeout: int,
     человеку»: 4xx — чинить запрос или права (`Refused`), 5xx и обрыв связи —
     повторить позже (`Unreachable`). Тело отказа сервера человеку показывается:
     у непрошедшего проверку пакета там список причин, и он и есть ответ.
+
+    Запрос, сорвавшийся ДО ОТПРАВКИ (`_not_sent`), повторяется сам — паузы
+    `CONNECT_RETRY_PAUSES_SEC`, каждая попытка с пометкой в stderr. Всё прочее
+    не повторяется никогда: ответ сервера — ответ, а обрыв после отправки мог
+    застать работу уже сделанной.
     """
     address = url + path
     if query:
@@ -950,26 +965,37 @@ def call(method: str, path: str, *, url: str, key: str, timeout: int,
     if body is not None:
         headers["Content-Type"] = "application/json; charset=utf-8"
     request = urllib.request.Request(address, data=body, headers=headers, method=method)
-    try:
-        with urlopen(request, timeout) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as refusal:
-        raise _refusal(refusal) from None
-    except UnicodeError:
-        # Заголовки едут latin-1. Ключ до сюда доходит уже проверенным
-        # (`access_key`), но страховка стоит: трассировка urllib вынесла бы
-        # значение заголовка в консоль.
-        raise Usage(
-            f"Запрос не собрать: в {KEY_ENV} или в названии отдела есть символы, "
-            f"которых там быть не может."
-        ) from None
-    except (urllib.error.URLError, ssl.SSLError, OSError) as broken:
-        # Сеть, DNS, TLS, таймаут: ответа нет вовсе. Применён ли пакет —
-        # неизвестно, и это честнее сказать, чем молча предложить повтор.
-        raise Unreachable(
-            f"Сервер не ответил ({type(broken).__name__}): {broken}. "
-            f"Проверь связь и {URL_ENV}, потом повтори."
-        ) from None
+    attempts = len(CONNECT_RETRY_PAUSES_SEC) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            with urlopen(request, timeout) as response:
+                raw = response.read()
+            break
+        except urllib.error.HTTPError as refusal:
+            raise _refusal(refusal) from None
+        except UnicodeError:
+            # Заголовки едут latin-1. Ключ до сюда доходит уже проверенным
+            # (`access_key`), но страховка стоит: трассировка urllib вынесла бы
+            # значение заголовка в консоль.
+            raise Usage(
+                f"Запрос не собрать: в {KEY_ENV} или в названии отдела есть символы, "
+                f"которых там быть не может."
+            ) from None
+        except (urllib.error.URLError, ssl.SSLError, OSError) as broken:
+            if (attempt < attempts and isinstance(broken, urllib.error.URLError)
+                    and _not_sent(broken)):
+                pause = CONNECT_RETRY_PAUSES_SEC[attempt - 1]
+                print(redact(f"Связь с сервером сорвалась до отправки запроса "
+                             f"({broken.reason}) — повторяю через {pause} с, попытка "
+                             f"{attempt + 1} из {attempts}.", key), file=sys.stderr)
+                time.sleep(pause)
+                continue
+            # Сеть, DNS, TLS, таймаут: ответа нет вовсе. Применён ли пакет —
+            # неизвестно, и это честнее сказать, чем молча предложить повтор.
+            raise Unreachable(
+                f"Сервер не ответил ({type(broken).__name__}): {broken}. "
+                f"Проверь связь и {URL_ENV}, потом повтори."
+            ) from None
     if not raw.strip():
         return {}
     try:
@@ -979,6 +1005,28 @@ def call(method: str, path: str, *, url: str, key: str, timeout: int,
     if not isinstance(parsed, dict):
         raise Unreachable("Сервер ответил не тем видом JSON, какой ждёт клиент")
     return parsed
+
+
+def _not_sent(broken: urllib.error.URLError) -> bool:
+    """Запрос до сервера целиком не дошёл, и повтор может помочь (#717).
+
+    «НЕ ДОШЁЛ» — ЗНАНИЕ, А НЕ ДОГАДКА, и даёт его устройство `urlopen`: `URLError`
+    (не `HTTPError`) он поднимает только из соединения и отправки — `do_open`
+    оборачивает в него сбой `h.request`, — а сбой после отправки, при ожидании и
+    чтении ответа, уходит голым `OSError` и сюда не попадает. Отправка,
+    оборвавшаяся на полпути, не довезла конца запроса, а без конца сервер не
+    делает ничего: ручки читают тело целиком до первого решения. Поэтому повтор
+    безопасен у ЛЮБОЙ ручки — пакет не применится дважды, второго поста в чат
+    отдела и второй задачи не будет.
+
+    Повторяется только сетевая причина (`OSError`: сброс, отказ, таймаут, DNS,
+    оборванное рукопожатие TLS). Подложный сертификат не пройдёт и со второго
+    раза — человек ждал бы впустую; слова urllib без сетевой причины (чужая
+    схема адреса) — не обрыв связи вовсе.
+    """
+    reason = broken.reason
+    return (isinstance(reason, OSError)
+            and not isinstance(reason, ssl.SSLCertVerificationError))
 
 
 def _refusal(refusal: urllib.error.HTTPError) -> ClientError:
