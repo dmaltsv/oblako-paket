@@ -91,7 +91,9 @@ ZOOM_KEY_ENVS = ("ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET")
 DEEPGRAM_PROJECTS = "https://api.deepgram.com/v1/projects"
 """Самая дешёвая дверь Deepgram: список проектов кабинета. Она ничего не
 распознаёт и денег не стоит — а живой ключ от отозванного отличает так же
-надёжно, как расшифровка."""
+надёжно, как расшифровка. Всегда американская, даже при `DEEPGRAM_HOST`
+(`transcribe.listen_url`): европейский вход этой двери не обслуживает (404,
+замер 11.11.2026), а ключ у входов общий."""
 
 
 class Report:

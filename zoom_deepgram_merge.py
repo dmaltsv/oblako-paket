@@ -40,7 +40,8 @@ from collections import defaultdict
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 from transcribe import (load_api_key, deepgram_urlopen,  # ключ, выход в сеть
-                        MIME_BY_EXT, VIDEO_EXT)          # и таблицы форматов
+                        listen_url, upload_body,         # вход и тело (#719)
+                        VIDEO_EXT)                       # и таблица форматов
 
 MAX_OFFSET = 1800  # ±30 мин: локальная запись стартует не в t0 встречи, разбег бывает большой
 
@@ -189,12 +190,9 @@ def deepgram(audio_path, model, lang):
         raise RuntimeError(f"нет ключа DEEPGRAM_API_KEY (окружение или {os.path.join(SCRIPT_DIR, '.env')})")
     q = (f"model={model}&language={lang}&smart_format=true"
          "&punctuate=true&diarize=true&utterances=true")
-    ext = os.path.splitext(audio_path)[1].lower()
-    mime = MIME_BY_EXT.get(ext, "audio/mpeg")
-    with open(audio_path, "rb") as f:
-        audio = f.read()
+    audio, mime = upload_body(audio_path)   # сжатая копия, если есть ffmpeg (#719)
     print(f"[Deepgram] отправляю {len(audio)/1024/1024:.0f} МБ, {model}/{lang} ... (~минута)", flush=True)
-    req = urllib.request.Request("https://api.deepgram.com/v1/listen?" + q,
+    req = urllib.request.Request(listen_url(q),
                                  data=audio, method="POST",
                                  headers={"Authorization": f"Token {key}", "Content-Type": mime})
     with deepgram_urlopen(req, timeout=1800) as r:

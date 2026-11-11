@@ -3,6 +3,9 @@ import os
 import sys
 import glob
 import json
+import shutil
+import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -88,6 +91,68 @@ def load_proxy():
     return (proxy or "").strip() or None
 
 
+DEFAULT_HOST = "api.deepgram.com"
+
+
+def listen_url(query):
+    """Адрес распознавания: вход Deepgram из настройки `DEEPGRAM_HOST`, иначе американский.
+
+    Настройка, а не замена адреса в коде (#719). 11.11.2026 на машине
+    руководителя американский вход принимал заливку на ~21 КБ/с и сам рвал её
+    ответом `408 SLOW_UPLOAD`, хотя интернет в ту же минуту отдавал 1,3 МБ/с:
+    узкое место — маршрут провайдера до США. Европейский `api.eu.deepgram.com`
+    тем же ключом взял двухчасовую запись целиком. Но умолчание обязано
+    остаться американским: этот же адрес берёт склейка, которую зовёт облачная
+    рутина автомата, а её сеть открыта списком, где только `api.deepgram.com`
+    (`Скиллы/avtomat.md`). Проверку ключа (`setup_check.DEEPGRAM_PROJECTS`)
+    настройка не двигает: европейский вход `/v1/projects` не обслуживает (404).
+    """
+    host = (oblako_client.settings(__file__).get("DEEPGRAM_HOST") or "").strip()
+    host = host.split("://")[-1].strip("/") or DEFAULT_HOST   # вписали с https:// — тоже годно
+    return f"https://{host}/v1/listen?{query}"
+
+
+SQUEEZE = ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "16k"]
+"""Речь в моно opus 16 кбит/с: двухчасовой m4a от Zoom (69 МБ) — 13 МБ.
+Распознаванию хватает: 11.11.2026 по такой копии склейка с Zoom сопоставила
+всех троих (чистота 79–93 %). Таймкоды те же — длительность не меняется."""
+
+
+def find_ffmpeg():
+    """Путь к ffmpeg или None. Отдельной функцией — её подменяют тесты, чтобы
+    исход не зависел от того, стоит ли ffmpeg на машине прогона."""
+    return shutil.which("ffmpeg")
+
+
+def upload_body(audio_path):
+    """Что отправить в Deepgram: (байты, тип). Есть ffmpeg — сжатая копия, нет — файл как есть.
+
+    Зачем (#719): 11.11.2026 с машины руководителя Deepgram не дождался
+    двухчасового m4a (69 МБ) даже через европейский вход — `408` через 9 минут
+    при ~93 КБ/с, а сжатая копия той же записи ушла за 140 с. ffmpeg пакет не
+    ставит, поэтому сжатие — по наличию: у кого его нет, всё идёт как раньше.
+    Не вышло сжать (битый файл, ffmpeg упал) — тоже исходный файл: лучше
+    медленная попытка, чем отказ на ровном месте.
+    """
+    ext = os.path.splitext(audio_path)[1].lower()
+    ffmpeg = find_ffmpeg()
+    if ffmpeg:
+        with tempfile.TemporaryDirectory() as tmp:
+            squeezed = os.path.join(tmp, "для Deepgram.ogg")
+            done = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                                   "-i", audio_path, *SQUEEZE, squeezed],
+                                  stdin=subprocess.DEVNULL, capture_output=True)
+            if done.returncode == 0 and os.path.getsize(squeezed) > 0:
+                with open(squeezed, "rb") as f:
+                    body = f.read()
+                print(f"[Deepgram] сжал запись: {os.path.getsize(audio_path)/1024/1024:.0f} → "
+                      f"{len(body)/1024/1024:.0f} МБ", flush=True)
+                return body, "audio/ogg"
+            print("[Deepgram] сжать не вышло — отправляю файл как есть", flush=True)
+    with open(audio_path, "rb") as f:
+        return f.read(), MIME_BY_EXT.get(ext, "audio/mpeg")
+
+
 def deepgram_urlopen(req, timeout):
     """Единственный выход в сеть к Deepgram — из этого файла и из склейки.
 
@@ -114,12 +179,9 @@ def deepgram_transcribe(file_path, api_key=None):
         raise RuntimeError(
             f"не найден ключ DEEPGRAM_API_KEY (окружение или .env от {SCRIPT_DIR} вверх)"
         )
-    with open(file_path, "rb") as f:
-        audio_bytes = f.read()
-    ext = os.path.splitext(file_path)[1].lower()
-    mime = MIME_BY_EXT.get(ext, "audio/mpeg")
+    audio_bytes, mime = upload_body(file_path)
     req = urllib.request.Request(
-        f"https://api.deepgram.com/v1/listen?{QUERY}",
+        listen_url(QUERY),
         data=audio_bytes,
         method="POST",
         headers={"Authorization": f"Token {key}", "Content-Type": mime},
